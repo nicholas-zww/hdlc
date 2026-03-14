@@ -9,6 +9,7 @@
 
 #define QUEUE_SIZE 256
 
+extern void initUserdata(void);
 extern void loggerInit();
 extern void usb_write(const char* data, size_t len);
 extern void uartInit(QueueHandle_t& uartQueue);
@@ -40,7 +41,7 @@ void task2(void *pvParameters)
 {
     while (true)
     {
-        LOGI("Task 2 running on core %d", xPortGetCoreID());
+        // LOGI("Task 2 running on core %d", xPortGetCoreID());
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 }
@@ -48,6 +49,7 @@ void task2(void *pvParameters)
 void app_entry()
 {
     loggerInit();
+
     QueueHandle_t uartQueue = xQueueCreate(QUEUE_SIZE, sizeof(char));
     if (uartQueue == nullptr) {
         LOGE("ERROR: Failed to create UART queue!");
@@ -55,6 +57,8 @@ void app_entry()
     }
 
     uartInit(uartQueue);
+
+    initUserdata();
 
     FrameProcessorInit(uartQueue, frame_received_callback, 256, 4096, 5);
     xTaskCreate(task2, "Task2", 4096, NULL, 5, NULL);
