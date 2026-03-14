@@ -25,7 +25,7 @@ static const uart_config_t uart_config = {
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT
-    };
+};
 
 #ifdef USING_LOG_UART
 extern "C" {

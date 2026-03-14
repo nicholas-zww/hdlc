@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "frame_processor.h"
 
 #define LOG_TAG "MainApp"
 #include "logger.h"
@@ -9,8 +10,31 @@
 #define QUEUE_SIZE 256
 
 extern void loggerInit();
+extern void usb_write(const char* data, size_t len);
 extern void uartInit(QueueHandle_t& uartQueue);
-extern void serialDataHandler(void *pvParameters);
+
+/**
+ * Callback function for receiving valid parsed frames
+ */
+static bool frame_received_callback(const uint8_t* payload, uint16_t length)
+{
+    printf("Receive Data: ");
+    for (uint16_t i = 0; i < length && i < 32; i++) {
+        printf("%02X ", payload[i]);
+    }
+    if (length > 32) {
+        printf("... (%u more bytes)", length - 32);
+    }
+    printf("\n");
+
+    uint8_t outData[32] = {0};
+    uint16_t outlen = FrameProcessorCreateFrame(payload, length, outData, sizeof(outData));
+    if (outlen > 0)
+    {
+        usb_write((const char*)outData, outlen);
+    }
+    return true;
+}
 
 void task2(void *pvParameters)
 {
@@ -31,6 +55,7 @@ void app_entry()
     }
 
     uartInit(uartQueue);
-    xTaskCreate(serialDataHandler, "serialDataHandler", 4096, (void*)uartQueue, 5, NULL);
+
+    FrameProcessorInit(uartQueue, frame_received_callback, 256, 4096, 5);
     xTaskCreate(task2, "Task2", 4096, NULL, 5, NULL);
 }

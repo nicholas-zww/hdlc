@@ -28,8 +28,8 @@ void usb_init(QueueHandle_t& uartQueue)
 {
     // USB Serial JTAG driver config
     usb_serial_jtag_driver_config_t config = {};
-    config.tx_buffer_size = 512;  // size in bytes
-    config.rx_buffer_size = 512;  // size in bytes
+    config.tx_buffer_size = 128;  // size in bytes
+    config.rx_buffer_size = 128;  // size in bytes
 
     // Install driver
     usb_serial_jtag_driver_install(&config);
