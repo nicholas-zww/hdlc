@@ -28,8 +28,8 @@ void usb_init(QueueHandle_t& uartQueue)
 {
     // USB Serial JTAG driver config
     usb_serial_jtag_driver_config_t config = {};
-    config.tx_buffer_size = 128;  // size in bytes
-    config.rx_buffer_size = 128;  // size in bytes
+    config.tx_buffer_size = 256;  // size in bytes
+    config.rx_buffer_size = 256;  // size in bytes
 
     // Install driver
     usb_serial_jtag_driver_install(&config);
@@ -47,5 +47,14 @@ void usb_init(QueueHandle_t& uartQueue)
 
 void usb_write(const char* data, size_t len)
 {
+    for (size_t i = 0; i < len; i++)
+    {
+        printf("%02x ", data[i]);
+    }
+    printf("\n");
+
     usb_serial_jtag_write_bytes(data, len, portMAX_DELAY);
+
+    if (usb_serial_jtag_wait_tx_done(portMAX_DELAY) != 0)
+        printf("\nusb_write failed\n");
 }

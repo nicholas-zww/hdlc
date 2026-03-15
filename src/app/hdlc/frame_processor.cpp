@@ -352,6 +352,8 @@ static void FrameProcessorTaskEntry(void* pvParameters)
     {
         if (xQueueReceive(g_processor.queue, &rxByte, xTicksToWait) == pdPASS)
         {
+            // LOGI("Receive rxByte %02x", rxByte);
+
             FrameProcessorParseFrame(rxByte);
         }
     }
@@ -560,7 +562,7 @@ uint16_t FrameProcessorCreateFrame(const uint8_t* payload, uint16_t payloadLen, 
     }
 
     /* Worst case: all bytes escape, so 2x payload + 8 bytes overhead */
-    if ((payloadLen == 0) || ((payloadLen + 6) > outBufSize))
+    if ((payloadLen == 0) || ((payloadLen + 8) > outBufSize))
     {
         LOGE("Create frame failed, incorrect payload length %d/%d", payloadLen, outBufSize);
         return 0;

@@ -7,6 +7,9 @@
 #define LOG_TAG "MainApp"
 #include "logger.h"
 
+#include "fileTransfer.h"
+
+
 #define QUEUE_SIZE 256
 
 extern void initUserdata(void);
@@ -14,26 +17,147 @@ extern void loggerInit();
 extern void usb_write(const char* data, size_t len);
 extern void uartInit(QueueHandle_t& uartQueue);
 
+static fileTransferReq fileTransfer;
+
+
+static void sendResponse(uint8_t *data, uint16_t length)
+{
+    if ((length < 1) || (data == NULL))
+    {
+        LOGE("Invalid payload data");
+        return;
+    }
+
+    uint16_t outSzie = length * 2 + 8;
+    uint8_t *outData = (uint8_t*)malloc(outSzie);
+
+    if (outData == NULL)
+    {
+        LOGE("malloc failed");
+        return;
+    }
+
+    uint16_t outlen = FrameProcessorCreateFrame(data, length, outData, outSzie);
+    if (outlen > 0)
+    {
+        usb_write((const char*)outData, outlen);
+    }
+    else
+    {
+        LOGE("failed to package msg");
+    }
+    free(outData);
+}
+
 /**
  * Callback function for receiving valid parsed frames
  */
 static bool frame_received_callback(const uint8_t* payload, uint16_t length)
 {
-    printf("Receive Data: ");
-    for (uint16_t i = 0; i < length && i < 32; i++) {
-        printf("%02X ", payload[i]);
-    }
-    if (length > 32) {
-        printf("... (%u more bytes)", length - 32);
-    }
-    printf("\n");
-
-    uint8_t outData[32] = {0};
-    uint16_t outlen = FrameProcessorCreateFrame(payload, length, outData, sizeof(outData));
-    if (outlen > 0)
+    if ((length < 1) || (payload == NULL))
     {
-        usb_write((const char*)outData, outlen);
+        LOGE("Invalid payload data");
+        return false;
     }
+
+    switch (payload[0])
+    {
+        case FILE_PACKAGE_ID_REQ:
+            if (sizeof(fileDataRequest_t) == length) {
+                fileDataRequest_t *req = (fileDataRequest_t *)payload;
+                auto resp = (package_t*)malloc(sizeof(package_t));
+                if (resp != nullptr) {
+                    resp->seqId = req->reqId;
+                    auto ret = fileTransfer.getTransferData((package_t*)resp);
+                    if (ret == fileTransferReq::NO_ERR) {
+                        resp->cmd = FILE_PACKAGE_DATA;
+                        sendResponse((uint8_t*)(resp), sizeof(package_t));
+                    }
+                    else {
+                        fileDataRequest_t endResp = {FILE_TRANSFER_DONE, static_cast<uint32_t>(ret)};
+                        sendResponse((uint8_t*)(&endResp), sizeof(fileDataRequest_t));
+                    }
+                    free(resp);
+                }
+                else {
+                    fileDataRequest_t endResp = {FILE_TRANSFER_DONE, static_cast<uint32_t>(FILE_TRANSFER_MEM_ERROR)};
+                    sendResponse((uint8_t*)(&endResp), sizeof(fileDataRequest_t));
+                }
+            }
+            else {
+                LOGE("Invalid payload length %d", length);
+            }
+            break;
+
+        case FILE_TRANSFER_GET:
+            if (sizeof(fileGetRequest_t) == length) {
+                fileGetRequest_t *req = (fileGetRequest_t *)payload;
+                filePushRequest_t resp;
+                auto ret = fileTransfer.raiseGetTransferReq(req, &resp);
+                if (ret == fileTransferReq::NO_ERR) {
+                    resp.cmd = FILE_TRANSFER_REQ;
+                    sendResponse((uint8_t*)(&resp), sizeof(filePushRequest_t));
+                }
+                else {
+                    fileDataRequest_t endResp = {FILE_TRANSFER_DONE, static_cast<uint32_t>(ret)};
+                    sendResponse((uint8_t*)(&endResp), sizeof(fileDataRequest_t));
+                }
+            }
+            else {
+                LOGE("Invalid payload length %d", length);
+            }
+            break;
+
+        case FILE_TRANSFER_REQ:
+            if (sizeof(filePushRequest_t) == length) {
+                filePushRequest_t *req = (filePushRequest_t *)payload;
+                auto ret = fileTransfer.raisePushTransferReq(req);
+                fileDataRequest_t resp;
+                if (ret == fileTransferReq::NO_ERR) {
+                    resp.cmd = FILE_PACKAGE_ID_REQ;
+                    resp.reqId = 0;
+                }
+                else {
+                    resp.cmd = FILE_TRANSFER_DONE;
+                    resp.reqId = static_cast<uint32_t>(ret);
+                }
+                sendResponse((uint8_t*)(&resp), sizeof(fileDataRequest_t));
+            }
+            else {
+                LOGE("Invalid payload length %d", length);
+            }
+            break;
+
+        case FILE_PACKAGE_DATA:
+            if (sizeof(package_t) == length) {
+                package_t *pack = (package_t*)payload;
+                LOGI("fileTransferDataPackage seq %d, len %d", pack->seqId, pack->len);
+
+                fileDataRequest_t resp;
+                auto ret = fileTransfer.pushTransferData(pack);
+                if (ret == fileTransferReq::NO_ERR) {
+                    resp.cmd = FILE_PACKAGE_ID_REQ;
+                    resp.reqId = pack->seqId+1;
+                }
+                else if (ret == fileTransferReq::TRANSFER_COMPLETE) {
+                    resp.cmd = FILE_TRANSFER_DONE;
+                    resp.reqId = 0;
+                }
+                else {
+                    resp.cmd = FILE_TRANSFER_DONE;
+                    resp.reqId = static_cast<uint32_t>(ret);
+                }
+                sendResponse((uint8_t*)(&resp), sizeof(fileDataRequest_t));
+            }
+            else {
+                LOGE("Invalid payload length %d", length);
+            }
+            break;
+
+        default:
+            break;
+    }
+
     return true;
 }
 
