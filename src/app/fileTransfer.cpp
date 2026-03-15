@@ -194,6 +194,8 @@ fileTransferReq::PACKAGE_RET_e fileTransferReq::pushTransferData(const package_t
         return FILE_NOT_OPEN;
     }
 
+    LOGI("pushTransferData seq %d/%d, len %d", pack->seqId, g_total, pack->len);
+
     size_t written = fwrite(pack->data, 1, pack->len, g_file);
     if (written != pack->len)
     {

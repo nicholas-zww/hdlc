@@ -6,6 +6,7 @@
 #include <esp_system.h>
 #include <string>
 #include <vector>
+#include <filesystem>
 
 #define LOG_TAG "OTA"
 #include "logger.h"
@@ -25,7 +26,7 @@ static void cleanOtaFile(const std::string& otaFile)
     }
 }
 
-void startOta(const std::string& otaFile, const size_t otaTotalSize)
+void startOta(const std::string& otaFile)
 {
     const esp_partition_t* configured = esp_ota_get_boot_partition();
     const esp_partition_t* running = esp_ota_get_running_partition();
@@ -37,6 +38,13 @@ void startOta(const std::string& otaFile, const size_t otaTotalSize)
 
     const esp_partition_t* update_partition = esp_ota_get_next_update_partition(nullptr);
     LOGI( "Writing to partition subtype %d at offset 0x%08x, size: %d", static_cast<int>(update_partition->subtype), update_partition->address, static_cast<int>(update_partition->size));
+
+    std::error_code ec;
+    const size_t otaTotalSize = std::filesystem::file_size(otaFile, ec);
+    if (ec) {
+        LOGE("Failed to get file size for %s: %s", otaFile.c_str(), ec.message().c_str());
+        return;
+    }
 
     FILE* file = ::fopen(otaFile.c_str(), "rb");
     if (! file)

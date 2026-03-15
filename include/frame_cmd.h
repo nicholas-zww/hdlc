@@ -37,6 +37,11 @@ typedef struct {
 
 
 typedef enum {
+    OTA_UPGRADE_REQ = 0xD0,
+    OTA_UPGRADE_RESP,
+    OTA_UPGRADE_FILE_MISSING,
+
+
     FILE_TRANSFER_REQ = 0xE0,
     FILE_TRANSFER_GET,
     FILE_PACKAGE_ID_REQ,

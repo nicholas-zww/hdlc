@@ -47,11 +47,11 @@ void usb_init(QueueHandle_t& uartQueue)
 
 void usb_write(const char* data, size_t len)
 {
-    for (size_t i = 0; i < len; i++)
-    {
-        printf("%02x ", data[i]);
-    }
-    printf("\n");
+    // for (size_t i = 0; i < len; i++)
+    // {
+    //     printf("%02x ", data[i]);
+    // }
+    // printf("\n");
 
     usb_serial_jtag_write_bytes(data, len, portMAX_DELAY);
 

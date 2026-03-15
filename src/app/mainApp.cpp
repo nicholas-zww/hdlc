@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "frame_processor.h"
+#include <filesystem>
 
 #define LOG_TAG "MainApp"
 #include "logger.h"
@@ -16,6 +17,7 @@ extern void initUserdata(void);
 extern void loggerInit();
 extern void usb_write(const char* data, size_t len);
 extern void uartInit(QueueHandle_t& uartQueue);
+extern void startOta(const std::string& otaFile);
 
 static fileTransferReq fileTransfer;
 
@@ -131,7 +133,6 @@ static bool frame_received_callback(const uint8_t* payload, uint16_t length)
         case FILE_PACKAGE_DATA:
             if (sizeof(package_t) == length) {
                 package_t *pack = (package_t*)payload;
-                LOGI("fileTransferDataPackage seq %d, len %d", pack->seqId, pack->len);
 
                 fileDataRequest_t resp;
                 auto ret = fileTransfer.pushTransferData(pack);
@@ -154,6 +155,14 @@ static bool frame_received_callback(const uint8_t* payload, uint16_t length)
             }
             break;
 
+        case OTA_UPGRADE_REQ:
+            if (!std::filesystem::exists("/userdata/firmware.bin")) {
+                uint8_t resp[] = {static_cast<uint8_t>(OTA_UPGRADE_RESP), static_cast<uint8_t>(OTA_UPGRADE_FILE_MISSING)};
+                sendResponse((uint8_t*)(&resp), sizeof(resp));
+            }
+            else {
+                startOta("/userdata/firmware.bin");
+            }
         default:
             break;
     }
@@ -167,6 +176,20 @@ void task2(void *pvParameters)
     {
         // LOGI("Task 2 running on core %d", xPortGetCoreID());
         vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+void listFiles(const std::string& path) {
+    try {
+        if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
+            for (const auto& entry : std::filesystem::directory_iterator(path)) {
+                // entry.path().filename() gives just "file.txt"
+                // entry.path() gives the full path "logs/file.txt"
+                LOGI("File: %s", entry.path().filename().c_str());
+            }
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        LOGE("Error: %s", e.what());
     }
 }
 
@@ -186,4 +209,7 @@ void app_entry()
 
     FrameProcessorInit(uartQueue, frame_received_callback, 256, 4096, 5);
     xTaskCreate(task2, "Task2", 4096, NULL, 5, NULL);
+
+    listFiles("/userdata");
+
 }

@@ -348,7 +348,7 @@ def main():
     codec = FrameCodec()
 
     FILE_PACKAGE_STRUCT = struct.Struct('<BI32sI')
-    path_bytes = "test.txt".encode('utf-8')[:32].ljust(32, b'\x00')
+    path_bytes = args.file.encode('utf-8')[:32].ljust(32, b'\x00')
     total_packages = calculate_package_count(args.file, args.size)
     cumulative_crc = crc32_file(args.file)
     file_package_data = FILE_PACKAGE_STRUCT.pack(0xE0, total_packages, path_bytes, cumulative_crc)
