@@ -1,6 +1,12 @@
-# This file was automatically generated for projects
-# without default 'CMakeLists.txt' file.
+# Keep this component limited to the project's own sources.
+# Using CMAKE_SOURCE_DIR recursively pulls in PlatformIO dependency examples
+# from .pio/libdeps, which creates duplicate setup/loop/app_main definitions.
+file(GLOB_RECURSE app_sources
+    "${COMPONENT_DIR}/*.cpp"
+)
 
-FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/**/*.cpp)
-
-idf_component_register(SRCS ${app_sources})
+idf_component_register(
+    SRCS ${app_sources}
+    INCLUDE_DIRS "../include"
+    REQUIRES libfipc libosal
+)

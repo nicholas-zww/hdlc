@@ -1,8 +1,7 @@
 #include <stdio.h>
 #include <stdarg.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
+#include "osal/osal_queue.h"
+#include "osal/osal_thread.h"
 
 extern "C" {
 #include "driver/uart.h"
@@ -32,7 +31,7 @@ extern "C" {
 #include "esp_log.h"
 }
 
-extern void usb_init(QueueHandle_t& uartQueue);
+extern void usb_init(osalQueue_t& uartQueue);
 
 static int uart_log_vprintf(const char *fmt, va_list args)
 {
@@ -47,6 +46,7 @@ static int uart_log_vprintf(const char *fmt, va_list args)
 }
 #else
 static QueueHandle_t uart_queue;
+static osalThread_t uart_task_thread;
 
 void uart_event_task(void *pvParameters)
 {
@@ -97,7 +97,7 @@ void loggerInit()
     esp_log_set_vprintf(uart_log_vprintf);
 }
 
-void uartInit(QueueHandle_t& uartQueue)
+void uartInit(osalQueue_t& uartQueue)
 {
     usb_init(uartQueue);
 }
@@ -118,8 +118,9 @@ void uart_write(const char* data, size_t len)
     uart_write_bytes(UART_PORT, data, len);
 }
 
-void uartInit(QueueHandle_t& uartQueue)
+void uartInit(osalQueue_t& uartQueue)
 {
+    (void)uartQueue;
     uart_param_config(UART_PORT, &uart_config);
 
     // Set UART pins
@@ -133,6 +134,12 @@ void uartInit(QueueHandle_t& uartQueue)
     uart_set_rx_full_threshold(UART_PORT, 1);
 
     // Create task
-    xTaskCreate(uart_event_task, "uart_event_task", 4096, NULL, 12, NULL);
+    const osalThreadAttr_t uartTaskAttr = {
+        .stack_size_bytes = 4096,
+        .priority = 12,
+        .detached = true,
+        .name = "uart_event_task",
+    };
+    osalThreadCreate(&uart_task_thread, uart_event_task, NULL, &uartTaskAttr);
 }
 #endif

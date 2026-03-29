@@ -24,6 +24,14 @@ import time
 import struct
 from typing import List, Tuple
 
+from file_transfer_payloads import (
+    CMD_FILE_DATA,
+    CMD_FILE_DATA_REQUEST,
+    CMD_FILE_TRANSFER_DONE,
+    FILE_DATA_REQUEST_STRUCT,
+    build_file_package_payload,
+)
+
 # ============================================================================
 # Protocol Constants
 # ============================================================================
@@ -347,14 +355,11 @@ def main():
 
     codec = FrameCodec()
 
-    FILE_PACKAGE_STRUCT = struct.Struct('<BI32sI')
-    path_bytes = args.file.encode('utf-8')[:32].ljust(32, b'\x00')
     total_packages = calculate_package_count(args.file, args.size)
     cumulative_crc = crc32_file(args.file)
-    file_package_data = FILE_PACKAGE_STRUCT.pack(0xE0, total_packages, path_bytes, cumulative_crc)
+    file_package_data = build_file_package_payload(args.file, total_packages, cumulative_crc)
     frame = codec.encode_frame(file_package_data)
 
-    FILE_DATA_REQUEST_STRUCT = struct.Struct('<BI')
     PACKAGE_STRUCT = create_package_struct(PACKAGE_LEN)
 
     # print(f"total package count {total_packages}")
@@ -423,15 +428,15 @@ def main():
                 payload = f["payload"]
                 try:
                     cmd, req_id = FILE_DATA_REQUEST_STRUCT.unpack(payload)
-                    if cmd == 0xE2:
+                    if cmd == CMD_FILE_DATA_REQUEST:
                         print(f"Transferring {req_id}/{total_packages}")
                         bufData = read_file_data(args.file, req_id*PACKAGE_LEN, PACKAGE_LEN)
-                        package_data = PACKAGE_STRUCT.pack(0xE3, req_id, len(bufData), bufData)
+                        package_data = PACKAGE_STRUCT.pack(CMD_FILE_DATA, req_id, len(bufData), bufData)
                         frame = codec.encode_frame(package_data)
                         # print("\n[SEND] ", " ".join(f"{b:02X}" for b in frame))
                         ser.write(frame)
                         ser.flush()
-                    elif cmd == 0xE4:
+                    elif cmd == CMD_FILE_TRANSFER_DONE:
                         print(f"file transfer finished, status {req_id}")
                         finished = True
                     else:

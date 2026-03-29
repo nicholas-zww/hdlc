@@ -24,6 +24,16 @@ import time
 import struct
 from typing import List, Tuple
 
+from file_transfer_payloads import (
+    CMD_FILE_DATA,
+    CMD_FILE_PACKAGE,
+    CMD_FILE_TRANSFER_DONE,
+    FILE_DATA_REQUEST_STRUCT,
+    FILE_PACKAGE_STRUCT,
+    build_file_data_request_payload,
+    build_file_request_payload,
+)
+
 # ============================================================================
 # Protocol Constants
 # ============================================================================
@@ -326,10 +336,6 @@ def create_package_struct(buffer_size):
     # Corresponds to: uint8_t cmd; uint32_t seqId; uint16_t len; uint8_t data[buffer_size];
     return struct.Struct(f'<BIH{buffer_size}s')
 
-def create_request_struct(buffer_size):
-    # Corresponds to: uint8_t cmd;uint8_t data[buffer_size];
-    return struct.Struct(f'<B{buffer_size}s')
-
 # ============================================================================
 # Main
 # ============================================================================
@@ -350,20 +356,8 @@ def main():
 
     codec = FrameCodec()
 
-    FILE_REQ_STRUCT = create_request_struct(32)
-    path_bytes = "test.txt".encode('utf-8')[:32].ljust(32, b'\x00')
-    file_req = FILE_REQ_STRUCT.pack(0xE1, path_bytes)
+    file_req = build_file_request_payload(args.file)
     frame = codec.encode_frame(file_req)
-
-
-    # FILE_PACKAGE_STRUCT = struct.Struct('<BI32sI')
-    # path_bytes = "test.txt".encode('utf-8')[:32].ljust(32, b'\x00')
-    # total_packages = calculate_package_count(args.file, args.size)
-    # cumulative_crc = crc32_file(args.file)
-    # file_package_data = FILE_PACKAGE_STRUCT.pack(0xE0, total_packages, path_bytes, cumulative_crc)
-    # frame = codec.encode_frame(file_package_data)
-
-    FILE_DATA_REQUEST_STRUCT = struct.Struct('<BI')
     PACKAGE_STRUCT = create_package_struct(PACKAGE_LEN)
 
     # print(f"total package count {total_packages}")
@@ -436,31 +430,29 @@ def main():
 
                     payload = f["payload"]
                     try:
-                        if payload[0] == 0xE0:
-                            FILE_PACKAGE_STRUCT = struct.Struct('<BI32sI')
+                        if payload[0] == CMD_FILE_PACKAGE:
                             _, totalPackage, _, g_crcValue = FILE_PACKAGE_STRUCT.unpack(payload)
                             print(f"total package count {totalPackage}")
                             req_id = 0
-                            reqPack = FILE_DATA_REQUEST_STRUCT.pack(0xE2, req_id)
+                            reqPack = build_file_data_request_payload(req_id)
                             frame = codec.encode_frame(reqPack)
                             ser.write(frame)
                             ser.flush()
 
-                        elif payload[0] == 0xE3:
+                        elif payload[0] == CMD_FILE_DATA:
                             print(f"file transfer started, status {req_id}/{totalPackage}")
-                            PACKAGE_STRUCT = create_package_struct(PACKAGE_LEN)
                             _, seqID, length, data = PACKAGE_STRUCT.unpack(payload)
                             req_id = seqID + 1
                             fin.write(data[:length])
                             if req_id < totalPackage:
-                                reqPack = FILE_DATA_REQUEST_STRUCT.pack(0xE2, req_id)
+                                reqPack = build_file_data_request_payload(req_id)
                                 frame = codec.encode_frame(reqPack)
                                 ser.write(frame)
                                 ser.flush()
                             else:
                                 print(f"file transfer finished, total package count {req_id}")
                                 finished = True
-                        elif payload[0] == 0xE4:
+                        elif payload[0] == CMD_FILE_TRANSFER_DONE:
                             print(f"file transfer finished, status {req_id}")
                             finished = True
                         else:
