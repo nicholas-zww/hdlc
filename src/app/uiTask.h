@@ -8,6 +8,17 @@
 enum class UiEventType : uint8_t
 {
     POWER_INFO = 0,
+    KEY_EVENT = 1,
+};
+
+enum class UiKeyId : uint8_t
+{
+    POWER = 0,
+};
+
+enum class UiKeyAction : uint8_t
+{
+    LONG_PRESS = 0,
 };
 
 struct UiPowerInfoEvent
@@ -21,6 +32,12 @@ struct UiPowerInfoEvent
     int32_t battery_level_percent;
     int32_t battery_current_ma;
     int32_t charging_current_ma;
+};
+
+struct UiKeyEventData
+{
+    UiKeyId key_id;
+    UiKeyAction action;
 };
 
 constexpr size_t UI_EVENT_DATA_MAX_SIZE = 64;

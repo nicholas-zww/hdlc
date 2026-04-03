@@ -1,6 +1,7 @@
 #include <cstdint>
 #include "osal/osal.h"
 #include <M5Unified.h>
+#include "powerManagementTask.h"
 #include "uiTask.h"
 
 #define LOG_TAG "PowerTask"
@@ -8,8 +9,15 @@
 
 namespace
 {
-constexpr uint32_t POWER_TASK_PERIOD_MS = 2000;
+constexpr uint32_t POWER_TASK_LOOP_MS = 100;
+constexpr uint32_t POWER_INFO_UPDATE_PERIOD_MS = 2000;
+constexpr uint32_t POWER_KEY_HOLD_MS = 3000;
+constexpr size_t POWER_EVENT_QUEUE_CAPACITY = 8;
+
 static osalThread_t powerTaskThread = {};
+static osalQueue_t powerEventQueue = {};
+static bool powerEventQueueReady = false;
+
 constexpr uint8_t AW9523_ADDR = 0x58;
 constexpr uint8_t AW9523_PORT0_REG = 0x02;
 constexpr uint8_t CORE_S3_BUS_EN_BIT = 0x02;
@@ -62,16 +70,81 @@ void forceDisableCoreS3BackPower()
     }
 }
 
+void sendPowerKeyLongPressToUi()
+{
+    UiEvent event = {};
+    event.type = UiEventType::KEY_EVENT;
+    UiKeyEventData keyData = {
+        .key_id = UiKeyId::POWER,
+        .action = UiKeyAction::LONG_PRESS,
+    };
+    if (!uiSetEventData(event, keyData) || !uiPostEvent(event)) {
+        LOGW("Failed to post POWER key event to UI");
+    }
+}
+
+void processPowerEvents()
+{
+    if (!powerEventQueueReady) {
+        return;
+    }
+
+    PowerEvent event = {};
+    while (osalQueueReceive(&powerEventQueue, &event, 0) == OSAL_STATUS_OK) {
+        if (event.type == PowerEventType::KEY_EVENT
+            && event.key_event.action == PowerKeyAction::POWEROFF_CONFIRM_YES) {
+            LOGI("Power off confirmed by UI");
+            M5.Power.powerOff();
+        }
+    }
+}
+
+void publishPowerInfo(bool usbPowered, bool chargeEnabled, bool batteryPresent, int chargeState,
+                      int16_t vbusVoltageMv, int16_t batteryVoltageMv,
+                      int32_t batteryLevel, int32_t batteryCurrentMa, int32_t chargingCurrentMa)
+{
+    UiPowerInfoEvent powerInfo = {};
+    powerInfo.usb_powered = usbPowered;
+    powerInfo.charge_enabled = chargeEnabled;
+    powerInfo.battery_present = batteryPresent;
+    powerInfo.charge_phase = static_cast<int8_t>(chargeState);
+    powerInfo.vbus_voltage_mv = vbusVoltageMv;
+    powerInfo.battery_voltage_mv = batteryVoltageMv;
+    powerInfo.battery_level_percent = batteryLevel;
+    powerInfo.battery_current_ma = batteryCurrentMa;
+    powerInfo.charging_current_ma = chargingCurrentMa;
+
+    UiEvent uiEvent = {};
+    uiEvent.type = UiEventType::POWER_INFO;
+    if (!uiSetEventData(uiEvent, powerInfo)) {
+        LOGW("UI power payload too large; dropped power event");
+    } else if (!uiPostEvent(uiEvent)) {
+        LOGW("UI queue full or not ready; dropped power event");
+    }
+}
+
 void powerTask(void* context)
 {
     (void)context;
 
     bool usbCableConnected = M5.Power.Axp2101.isVBUS();
     uint8_t dischargeWhileVbusCount = 0;
+    bool powerKeyHoldLatched = false;
+    uint32_t powerInfoElapsedMs = POWER_INFO_UPDATE_PERIOD_MS;
 
     while (true) {
-        // Keep CoreS3 boost/output paths hard-disabled so VBUS sensing reflects external USB only.
         forceDisableCoreS3BackPower();
+        M5.update();
+        processPowerEvents();
+
+        if (!powerKeyHoldLatched
+            && (M5.BtnPWR.wasHold() || (M5.BtnPWR.isHolding() && M5.BtnPWR.pressedFor(POWER_KEY_HOLD_MS)))) {
+            sendPowerKeyLongPressToUi();
+            powerKeyHoldLatched = true;
+        }
+        if (M5.BtnPWR.wasReleased() || M5.BtnPWR.isReleased()) {
+            powerKeyHoldLatched = false;
+        }
 
         const uint64_t irqStatus = M5.Power.Axp2101.getIRQStatuses();
         const bool vbusInsertIrq = (irqStatus & static_cast<uint64_t>(m5::AXP2101_IRQ_VBUS_INSERT)) != 0;
@@ -96,21 +169,16 @@ void powerTask(void* context)
         const uint8_t reg18 = M5.Power.Axp2101.readRegister8(0x18);
         const bool chargeEnabled = (reg18 & 0x02) != 0;
 
-        if (vbusInsertIrq && !vbusRemoveIrq) {
-            usbCableConnected = true;
-        } else if (vbusRemoveIrq && !vbusInsertIrq) {
-            usbCableConnected = false;
-        } else if (!vbusPresentRaw) {
+        if (!vbusPresentRaw) {
             usbCableConnected = false;
         }
 
-        // Fallback for boards where VBUS level can stay high due backfeed:
-        // sustained discharge state implies USB input is not actually supplying power.
+        // Fallback for boards where VBUS level can stay high due backfeed.
         if (chargeState == -1 && vbusPresentRaw) {
             if (dischargeWhileVbusCount < 255) {
                 dischargeWhileVbusCount++;
             }
-            if (dischargeWhileVbusCount >= 2) { // 2 consecutive cycles (~4s)
+            if (dischargeWhileVbusCount >= 2) {
                 usbCableConnected = false;
             }
         } else {
@@ -124,40 +192,37 @@ void powerTask(void* context)
         const char* powerState = stablePowerState(vbusPresent, chargeEnabled);
         const char* effectiveState = axp2101EffectiveState(vbusPresent, chargeEnabled, chargeState);
 
-        UiPowerInfoEvent powerInfo = {};
-        powerInfo.usb_powered = vbusPresent;
-        powerInfo.charge_enabled = chargeEnabled;
-        powerInfo.battery_present = batteryPresent;
-        powerInfo.charge_phase = static_cast<int8_t>(chargeState);
-        powerInfo.vbus_voltage_mv = vbusVoltageMv;
-        powerInfo.battery_voltage_mv = batteryVoltageMv;
-        powerInfo.battery_level_percent = batteryLevel;
-        powerInfo.battery_current_ma = batteryCurrentMa;
-        powerInfo.charging_current_ma = chargingCurrentMa;
+        if (powerInfoElapsedMs >= POWER_INFO_UPDATE_PERIOD_MS) {
+            publishPowerInfo(vbusPresent, chargeEnabled, batteryPresent, chargeState,
+                             vbusVoltageMv, batteryVoltageMv, batteryLevel,
+                             batteryCurrentMa, chargingCurrentMa);
 
-        UiEvent uiEvent = {};
-        uiEvent.type = UiEventType::POWER_INFO;
-        if (!uiSetEventData(uiEvent, powerInfo)) {
-            LOGW("UI power payload too large; dropped power event");
-        } else if (!uiPostEvent(uiEvent)) {
-            LOGW("UI queue full or not ready; dropped power event");
+            LOGI("PMIC=AXP2101 power=%s phase=%s raw_vbus=%dmV bat=%ld%%(%dmV)",
+                 powerState,
+                 effectiveState,
+                 static_cast<int>(vbusVoltageMv),
+                 static_cast<long>(batteryLevel),
+                 static_cast<int>(batteryVoltageMv));
+
+            powerInfoElapsedMs = 0;
         }
 
-        LOGI("PMIC=AXP2101 power=%s phase=%s, raw_vbus=%dmV, bat_present=%d bat=%ld%%(%dmV)",
-                powerState,
-                effectiveState,
-                static_cast<int>(vbusVoltageMv),
-                static_cast<int>(batteryPresent),
-                static_cast<long>(batteryLevel),
-                static_cast<int>(batteryVoltageMv));
-
-        osalThreadSleepMs(POWER_TASK_PERIOD_MS);
+        osalThreadSleepMs(POWER_TASK_LOOP_MS);
+        powerInfoElapsedMs += POWER_TASK_LOOP_MS;
     }
 }
 } // namespace
 
 bool startPowerManagementTask()
 {
+    if (!powerEventQueueReady) {
+        if (osalQueueInit(&powerEventQueue, sizeof(PowerEvent), POWER_EVENT_QUEUE_CAPACITY) != OSAL_STATUS_OK) {
+            LOGE("Failed to create power event queue");
+            return false;
+        }
+        powerEventQueueReady = true;
+    }
+
     auto cfg = M5.config();
     cfg.clear_display = false;
     cfg.fallback_board = m5::board_t::board_M5StackCoreS3;
@@ -170,8 +235,8 @@ bool startPowerManagementTask()
     M5.Power.setBatteryCharge(true);
     M5.Power.setChargeCurrent(500);
     M5.Power.setChargeVoltage(4200);
-    // M5Unified AXP2101 enableIRQ() has unreliable return value in this version.
-    // Enable VBUS insert/remove IRQs directly via IRQEN1 register.
+    M5.BtnPWR.setHoldThresh(POWER_KEY_HOLD_MS);
+
     const uint8_t irqen1 = M5.Power.Axp2101.readRegister8(AXP2101_IRQEN1_REG);
     M5.Power.Axp2101.writeRegister8(AXP2101_IRQEN1_REG, static_cast<uint8_t>(irqen1 | AXP2101_VBUS_IRQ_MASK));
     M5.Power.Axp2101.clearIRQStatuses();
@@ -190,4 +255,12 @@ bool startPowerManagementTask()
 
     LOGI("PowerTask started and charging enabled");
     return true;
+}
+
+bool postPowerEvent(const PowerEvent& event)
+{
+    if (!powerEventQueueReady) {
+        return false;
+    }
+    return osalQueueSend(&powerEventQueue, &event, 0) == OSAL_STATUS_OK;
 }
