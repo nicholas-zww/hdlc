@@ -2,12 +2,24 @@
 
 #include "osal/osal_queue.h"
 #include "osal/osal_thread.h"
+#include "osal/osal_mutex.h"
 
 extern "C" {
 #include "driver/usb_serial_jtag.h"
 }
 
 static osalThread_t usb_thread;
+static osalMutex_t usb_write_mutex = {};
+static bool usb_write_mutex_initialized = false;
+
+static void init_usb_write_mutex()
+{
+    if (!usb_write_mutex_initialized) {
+        if (osalMutexInit(&usb_write_mutex) == OSAL_STATUS_OK) {
+            usb_write_mutex_initialized = true;
+        }
+    }
+}
 
 void usb_task(void* arg)
 {
@@ -27,6 +39,8 @@ void usb_task(void* arg)
 // Initialize USB‑Serial‑JTAG driver and start task
 void usb_init(osalQueue_t& uartQueue)
 {
+    init_usb_write_mutex();
+
     // USB Serial JTAG driver config
     usb_serial_jtag_driver_config_t config = {};
     config.tx_buffer_size = 256;  // size in bytes
@@ -53,10 +67,22 @@ bool usb_write(const uint8_t* data, uint16_t len)
     // }
     // printf("\n");
 
-    usb_serial_jtag_write_bytes(data, len, OSAL_WAIT_FOREVER);
+    if (usb_write_mutex_initialized
+        && osalMutexLock(&usb_write_mutex, OSAL_WAIT_FOREVER) == OSAL_STATUS_OK) {
+        usb_serial_jtag_write_bytes(data, len, OSAL_WAIT_FOREVER);
 
-    if (usb_serial_jtag_wait_tx_done(OSAL_WAIT_FOREVER) != 0)
-        printf("\nusb_write failed\n");
+        if (usb_serial_jtag_wait_tx_done(OSAL_WAIT_FOREVER) != 0) {
+            printf("\nusb_write failed\n");
+        }
+
+        (void)osalMutexUnlock(&usb_write_mutex);
+    } else {
+        usb_serial_jtag_write_bytes(data, len, OSAL_WAIT_FOREVER);
+
+        if (usb_serial_jtag_wait_tx_done(OSAL_WAIT_FOREVER) != 0) {
+            printf("\nusb_write failed\n");
+        }
+    }
 
     return true;
 }

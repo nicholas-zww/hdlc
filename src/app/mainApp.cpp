@@ -2,6 +2,7 @@
 #include "osal/osal.h"
 #include "frame_processing.h"
 #include <filesystem>
+#include "powerManagementTask.h"
 
 #define LOG_TAG "MainApp"
 #include "logger.h"
@@ -25,16 +26,6 @@ static bool frame_received_callback(uint8_t command, const uint8_t *payload, uin
     return true;
 }
 
-static void task2(void *context)
-{
-    (void)context;
-
-    while (true)
-    {
-        osalThreadSleepMs(2000);
-    }
-}
-
 void listFiles(const std::string& path) {
     try {
         if (std::filesystem::exists(path) && std::filesystem::is_directory(path)) {
@@ -54,7 +45,6 @@ void app_entry()
     loggerInit();
 
     static osalQueue_t uartQueue = {};
-    static osalThread_t task2Thread = {};
 
     if (osalQueueInit(&uartQueue, sizeof(char), QUEUE_SIZE) != OSAL_STATUS_OK) {
         LOGE("ERROR: Failed to create UART queue!");
@@ -68,14 +58,8 @@ void app_entry()
     fipcFrameProcessingSetFrameReceivedCallback(frame_received_callback);
     fipcFrameProcessingInit(&uartQueue, usb_write);
 
-    const osalThreadAttr_t task2Attr = {
-        .stack_size_bytes = 4096,
-        .priority = 5,
-        .detached = true,
-        .name = "Task2",
-    };
-    if (osalThreadCreate(&task2Thread, task2, nullptr, &task2Attr) != OSAL_STATUS_OK) {
-        LOGE("ERROR: Failed to create Task2");
+    if (!startPowerManagementTask()) {
+        LOGE("ERROR: Failed to start power management task");
     }
 
     listFiles("/userdata");

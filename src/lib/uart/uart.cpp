@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include "osal/osal_queue.h"
 #include "osal/osal_thread.h"
+#include "osal/osal_mutex.h"
 
 extern "C" {
 #include "driver/uart.h"
@@ -26,6 +27,30 @@ static const uart_config_t uart_config = {
         .source_clk = UART_SCLK_DEFAULT
 };
 
+static osalMutex_t uart_write_mutex = {};
+static bool uart_write_mutex_initialized = false;
+
+static void init_uart_write_mutex(void)
+{
+    if (!uart_write_mutex_initialized) {
+        if (osalMutexInit(&uart_write_mutex) == OSAL_STATUS_OK) {
+            uart_write_mutex_initialized = true;
+        }
+    }
+}
+
+static void uart_write_bytes_threadsafe(const char* data, size_t len)
+{
+    if (uart_write_mutex_initialized
+        && osalMutexLock(&uart_write_mutex, OSAL_WAIT_FOREVER) == OSAL_STATUS_OK) {
+        uart_write_bytes(UART_PORT, data, len);
+        (void)osalMutexUnlock(&uart_write_mutex);
+        return;
+    }
+
+    uart_write_bytes(UART_PORT, data, len);
+}
+
 #ifdef USING_LOG_UART
 extern "C" {
 #include "esp_log.h"
@@ -37,9 +62,13 @@ static int uart_log_vprintf(const char *fmt, va_list args)
 {
     char buffer[256];
     int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+    int write_len = len;
+    if (write_len > static_cast<int>(sizeof(buffer) - 1)) {
+        write_len = static_cast<int>(sizeof(buffer) - 1);
+    }
 
-    if (len > 0) {
-        uart_write_bytes(UART_PORT, buffer, len);
+    if (write_len > 0) {
+        uart_write_bytes_threadsafe(buffer, static_cast<size_t>(write_len));
     }
 
     return len;
@@ -87,6 +116,8 @@ void uart_event_task(void *pvParameters)
 #ifdef USING_LOG_UART
 void loggerInit()
 {
+    init_uart_write_mutex();
+
     uart_param_config(UART_PORT, &uart_config);
 
     // Set UART pins
@@ -104,18 +135,19 @@ void uartInit(osalQueue_t& uartQueue)
 
 void uart_write(const char* data, size_t len)
 {
-    uart_write_bytes(UART_PORT, data, len);
+    uart_write_bytes_threadsafe(data, len);
 }
 
 #else
 void loggerInit()
 {
+    init_uart_write_mutex();
 
 }
 
 void uart_write(const char* data, size_t len)
 {
-    uart_write_bytes(UART_PORT, data, len);
+    uart_write_bytes_threadsafe(data, len);
 }
 
 void uartInit(osalQueue_t& uartQueue)
