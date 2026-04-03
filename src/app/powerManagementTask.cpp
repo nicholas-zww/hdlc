@@ -1,6 +1,7 @@
 #include <cstdint>
 #include "osal/osal.h"
 #include <M5Unified.h>
+#include "uiTask.h"
 
 #define LOG_TAG "PowerTask"
 #include "logger.h"
@@ -17,18 +18,6 @@ constexpr uint8_t CORE_S3_BOOST_EN_BIT = 0x80;
 constexpr uint8_t AXP2101_IRQEN1_REG = 0x41;
 constexpr uint8_t AXP2101_VBUS_IRQ_MASK = 0xC0; // bit7:insert, bit6:remove
 constexpr uint32_t POWER_I2C_FREQ = 100000;
-
-const char* chargingStatusToString(m5::Power_Class::is_charging_t status)
-{
-    switch (status) {
-        case m5::Power_Class::is_charging_t::is_charging:
-            return "charging";
-        case m5::Power_Class::is_charging_t::is_discharging:
-            return "discharging";
-        default:
-            return "unknown";
-    }
-}
 
 const char* axp2101EffectiveState(bool vbusPresent, bool chargeEnabled, int chargeState)
 {
@@ -95,8 +84,9 @@ void powerTask(void* context)
             usbCableConnected = false;
         }
 
-        const auto status = M5.Power.isCharging();
         const int32_t batteryLevel = M5.Power.getBatteryLevel();
+        const int32_t batteryCurrentMa = M5.Power.getBatteryCurrent();
+        const int32_t chargingCurrentMa = (batteryCurrentMa > 0) ? batteryCurrentMa : 0;
         const int16_t batteryVoltageMv = quantizeMv(M5.Power.getBatteryVoltage());
         const int16_t vbusVoltageMv = quantizeMv(M5.Power.getVBUSVoltage());
 
@@ -131,9 +121,27 @@ void powerTask(void* context)
         }
 
         const bool vbusPresent = usbCableConnected;
-        const int stableStateId = (!vbusPresent) ? 0 : (chargeEnabled ? 1 : 2);
         const char* powerState = stablePowerState(vbusPresent, chargeEnabled);
         const char* effectiveState = axp2101EffectiveState(vbusPresent, chargeEnabled, chargeState);
+
+        UiPowerInfoEvent powerInfo = {};
+        powerInfo.usb_powered = vbusPresent;
+        powerInfo.charge_enabled = chargeEnabled;
+        powerInfo.battery_present = batteryPresent;
+        powerInfo.charge_phase = static_cast<int8_t>(chargeState);
+        powerInfo.vbus_voltage_mv = vbusVoltageMv;
+        powerInfo.battery_voltage_mv = batteryVoltageMv;
+        powerInfo.battery_level_percent = batteryLevel;
+        powerInfo.battery_current_ma = batteryCurrentMa;
+        powerInfo.charging_current_ma = chargingCurrentMa;
+
+        UiEvent uiEvent = {};
+        uiEvent.type = UiEventType::POWER_INFO;
+        if (!uiSetEventData(uiEvent, powerInfo)) {
+            LOGW("UI power payload too large; dropped power event");
+        } else if (!uiPostEvent(uiEvent)) {
+            LOGW("UI queue full or not ready; dropped power event");
+        }
 
         LOGI("PMIC=AXP2101 power=%s phase=%s, raw_vbus=%dmV, bat_present=%d bat=%ld%%(%dmV)",
                 powerState,

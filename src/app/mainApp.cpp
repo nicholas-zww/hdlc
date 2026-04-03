@@ -3,6 +3,7 @@
 #include "frame_processing.h"
 #include <filesystem>
 #include "powerManagementTask.h"
+#include "uiTask.h"
 
 #define LOG_TAG "MainApp"
 #include "logger.h"
@@ -57,6 +58,10 @@ void app_entry()
 
     fipcFrameProcessingSetFrameReceivedCallback(frame_received_callback);
     fipcFrameProcessingInit(&uartQueue, usb_write);
+
+    if (!startUiTask()) {
+        LOGE("ERROR: Failed to start UI task");
+    }
 
     if (!startPowerManagementTask()) {
         LOGE("ERROR: Failed to start power management task");
