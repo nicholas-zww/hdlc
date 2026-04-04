@@ -135,3 +135,4 @@ bool uiTryGetEventData(const UiEvent& event, T& out)
 
 [[nodiscard]] bool startUiTask();
 [[nodiscard]] bool uiPostEvent(const UiEvent& event);
+[[nodiscard]] bool uiRequestDisplayPowerAndWait(UiDisplayPowerAction action, uint32_t timeout_ms);

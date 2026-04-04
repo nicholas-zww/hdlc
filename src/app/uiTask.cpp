@@ -3,6 +3,7 @@
 #include "osal/osal.h"
 
 #include <M5Unified.h>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -17,6 +18,8 @@ constexpr uint32_t kLoopMs = 50;
 constexpr uint32_t kColorBackground = 0x0000;
 constexpr uint32_t kColorForeground = 0xFFFF;
 constexpr uint8_t kDisplayRotation = 3;  // 180 degree rotation
+constexpr uint8_t kDisplayBrightnessAwake = 128;
+constexpr uint8_t kDisplayBrightnessSleep = 0;
 constexpr int kOriginX = 8;
 constexpr int kOriginY = 8;
 constexpr int kLineHeight = 18;
@@ -71,6 +74,8 @@ struct Rect
 constexpr Rect kYesButton = {40, 170, 100, 44};
 constexpr Rect kNoButton = {180, 170, 100, 44};
 
+std::atomic<uint8_t> gDisplaySleepState = {0}; // 0=awake, 1=sleeping
+
 class UiController
 {
 public:
@@ -81,6 +86,7 @@ public:
         }
 
         initializeDisplay();
+        gDisplaySleepState.store(0, std::memory_order_release);
         proximitySensorReady_ = initializeProximitySensor();
         if (proximitySensorReady_) {
             LOGI("LTR553 proximity sensor initialized in UI task");
@@ -148,8 +154,6 @@ private:
         bool displaySleeping = false;
         bool proximityValid = false;
         uint32_t nextProximitySampleMs = 0;
-        ProximityStatus lastPublishedProximity = {};
-        bool lastPublishedProximityValid = false;
     };
 
     static void taskEntry(void* context)
@@ -248,6 +252,7 @@ private:
         cfg.output_power = false;
         M5.begin(cfg);
         M5.Display.setRotation(kDisplayRotation);
+        M5.Display.setBrightness(kDisplayBrightnessAwake);
     }
 
     static void sendPowerOffConfirmToPowerTask()
@@ -266,31 +271,6 @@ private:
                && a.closed == b.closed
                && a.proximityRaw == b.proximityRaw
                && a.ambientRaw == b.ambientRaw;
-    }
-
-    bool publishIdlePolicyToPowerTask(bool force)
-    {
-        const bool allowLowPowerNow =
-            state_.latestProximity.available && state_.latestProximity.closed;
-        const bool allowLowPowerLast =
-            state_.lastPublishedProximity.available && state_.lastPublishedProximity.closed;
-
-        if (!force && state_.lastPublishedProximityValid && (allowLowPowerNow == allowLowPowerLast)) {
-            return true;
-        }
-
-        PowerEvent event = {};
-        event.type = PowerEventType::IDLE_POLICY_UPDATE;
-        event.idle_policy_event.allow_low_power = allowLowPowerNow;
-
-        if (!postPowerEvent(event)) {
-            LOGW("Failed to post idle policy update to power task");
-            return false;
-        }
-
-        state_.lastPublishedProximity = state_.latestProximity;
-        state_.lastPublishedProximityValid = true;
-        return true;
     }
 
     [[nodiscard]] bool ltrReadRegister(uint8_t reg, uint8_t& value) const
@@ -411,7 +391,6 @@ private:
             state_.latestProximity.ambientRaw = -1;
             state_.proximityValid = false;
             state_.hasProximity = true;
-            publishIdlePolicyToPowerTask(true);
             if (state_.screen == Screen::PowerInfo) {
                 renderPowerInfoScreen();
             }
@@ -441,12 +420,9 @@ private:
 
         state_.hasProximity = true;
 
-        const bool changed = !state_.lastPublishedProximityValid
-                             || !prevValid
-                             || (prevClosed != state_.latestProximity.closed);
+        const bool changed = !prevValid || (prevClosed != state_.latestProximity.closed);
 
         if (changed) {
-            publishIdlePolicyToPowerTask(false);
             if (state_.screen == Screen::PowerInfo) {
                 renderPowerInfoScreen();
             }
@@ -846,22 +822,33 @@ private:
     void sleepDisplayIfNeeded()
     {
         if (state_.displaySleeping) {
+            gDisplaySleepState.store(1, std::memory_order_release);
             return;
         }
 
+        M5.Display.startWrite();
+        M5.Display.fillScreen(kColorBackground);
+        M5.Display.endWrite();
+        M5.Display.waitDisplay();
+        M5.Display.setBrightness(kDisplayBrightnessSleep);
         M5.Display.sleep();
         M5.Display.waitDisplay();
+        M5.Display.setBrightness(kDisplayBrightnessSleep);
         state_.displaySleeping = true;
+        gDisplaySleepState.store(1, std::memory_order_release);
     }
 
     void wakeDisplayIfNeeded()
     {
         if (!state_.displaySleeping) {
+            gDisplaySleepState.store(0, std::memory_order_release);
             return;
         }
 
         M5.Display.wakeup();
+        M5.Display.setBrightness(kDisplayBrightnessAwake);
         state_.displaySleeping = false;
+        gDisplaySleepState.store(0, std::memory_order_release);
 
         if (state_.screen == Screen::PowerInfo) {
             resetPowerInfoRenderCache();
@@ -977,4 +964,28 @@ bool startUiTask()
 bool uiPostEvent(const UiEvent& event)
 {
     return gUiController.postEvent(event);
+}
+
+bool uiRequestDisplayPowerAndWait(UiDisplayPowerAction action, uint32_t timeout_ms)
+{
+    UiEvent event = {};
+    event.type = UiEventType::DISPLAY_POWER;
+
+    UiDisplayPowerEventData payload = {};
+    payload.action = action;
+
+    if (!uiSetEventData(event, payload) || !uiPostEvent(event)) {
+        return false;
+    }
+
+    const uint8_t expectedState = (action == UiDisplayPowerAction::SLEEP) ? 1 : 0;
+    const uint32_t startMs = M5.millis();
+    while ((M5.millis() - startMs) < timeout_ms) {
+        if (gDisplaySleepState.load(std::memory_order_acquire) == expectedState) {
+            return true;
+        }
+        osalThreadSleepMs(10);
+    }
+
+    return gDisplaySleepState.load(std::memory_order_acquire) == expectedState;
 }
