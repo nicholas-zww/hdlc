@@ -252,12 +252,12 @@ private:
             if (state_.powerInfoElapsedMs >= kPowerInfoUpdatePeriodMs) {
                 publishPowerInfo(readings);
 
-                LOGI("PMIC=AXP2101 power=%s phase=%s raw_vbus=%dmV bat=%ld%%(%dmV)",
-                     readings.powerState,
-                     readings.effectiveState,
-                     static_cast<int>(readings.vbusVoltageMv),
-                     static_cast<long>(readings.batteryLevel),
-                     static_cast<int>(readings.batteryVoltageMv));
+                // LOGI("PMIC=AXP2101 power=%s phase=%s raw_vbus=%dmV bat=%ld%%(%dmV)",
+                //      readings.powerState,
+                //      readings.effectiveState,
+                //      static_cast<int>(readings.vbusVoltageMv),
+                //      static_cast<long>(readings.batteryLevel),
+                //      static_cast<int>(readings.batteryVoltageMv));
 
                 state_.powerInfoElapsedMs = 0;
             }

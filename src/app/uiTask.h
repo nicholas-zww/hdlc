@@ -10,6 +10,7 @@ enum class UiEventType : uint8_t
     POWER_INFO = 0,
     KEY_EVENT = 1,
     WAKEUP_EVENT = 2,
+    WIFI_STATUS = 3,
 };
 
 enum class UiKeyId : uint8_t
@@ -54,6 +55,21 @@ struct UiWakeupEventData
     UiWakeupSource source = UiWakeupSource::UNKNOWN;
     int32_t wakeup_cause = 0;
     int32_t sleep_error = 0;
+};
+
+enum class UiWifiConnectionState : uint8_t
+{
+    IDLE = 0,
+    CONNECTING = 1,
+    CONNECTED = 2,
+    DISCONNECTED = 3,
+    RECONNECTING = 4,
+};
+
+struct UiWifiStatusEventData
+{
+    UiWifiConnectionState state = UiWifiConnectionState::IDLE;
+    char ip_address[16] = {};
 };
 
 constexpr size_t UI_EVENT_DATA_MAX_SIZE = 64;

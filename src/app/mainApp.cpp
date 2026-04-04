@@ -2,8 +2,10 @@
 #include "osal/osal.h"
 #include "frame_processing.h"
 #include <filesystem>
+#include <cstring>
 #include "powerManagementTask.h"
 #include "uiTask.h"
+#include "wifiManagerTask.h"
 
 #define LOG_TAG "MainApp"
 #include "logger.h"
@@ -11,6 +13,9 @@
 
 
 #define QUEUE_SIZE 256
+constexpr uint8_t APP_COMMAND_SET_WIFI_CREDENTIALS = 0x30;
+constexpr uint8_t WIFI_SSID_MAX_LEN = 32;
+constexpr uint8_t WIFI_PASSWORD_MAX_LEN = 64;
 
 extern void initUserdata(void);
 extern void loggerInit();
@@ -23,6 +28,37 @@ extern void startOta(const std::string& otaFile);
  */
 static bool frame_received_callback(uint8_t command, const uint8_t *payload, uint16_t payloadLength)
 {
+    if (command == APP_COMMAND_SET_WIFI_CREDENTIALS) {
+        if (payload == nullptr || payloadLength < 2U) {
+            LOGW("SET_WIFI_CREDENTIALS invalid payload");
+            return false;
+        }
+
+        const uint8_t ssidLen = payload[0];
+        const uint8_t passwordLen = payload[1];
+        const uint16_t expectedLen = static_cast<uint16_t>(2U + ssidLen + passwordLen);
+        if (ssidLen > WIFI_SSID_MAX_LEN || passwordLen > WIFI_PASSWORD_MAX_LEN || payloadLength != expectedLen) {
+            LOGW("SET_WIFI_CREDENTIALS invalid lengths ssid=%u pass=%u payload=%u",
+                 static_cast<unsigned>(ssidLen),
+                 static_cast<unsigned>(passwordLen),
+                 static_cast<unsigned>(payloadLength));
+            return false;
+        }
+
+        char ssid[WIFI_SSID_MAX_LEN + 1] = {};
+        char password[WIFI_PASSWORD_MAX_LEN + 1] = {};
+
+        if (ssidLen > 0U) {
+            std::memcpy(ssid, &payload[2], ssidLen);
+        }
+        if (passwordLen > 0U) {
+            std::memcpy(password, &payload[2U + ssidLen], passwordLen);
+        }
+
+        const bool applied = wifiSetCredentials(ssid, password);
+        LOGI("SET_WIFI_CREDENTIALS result=%s", applied ? "ok" : "failed");
+        return applied;
+    }
 
     return true;
 }
@@ -65,6 +101,10 @@ void app_entry()
 
     if (!startPowerManagementTask()) {
         LOGE("ERROR: Failed to start power management task");
+    }
+
+    if (!startWifiManagerTask()) {
+        LOGE("ERROR: Failed to start wifi manager task");
     }
 
     listFiles("/userdata");

@@ -8,5 +8,5 @@ file(GLOB_RECURSE app_sources
 idf_component_register(
     SRCS ${app_sources}
     INCLUDE_DIRS "../include"
-    REQUIRES libfipc libosal
+    REQUIRES libfipc libosal esp_wifi esp_event esp_netif nvs_flash
 )

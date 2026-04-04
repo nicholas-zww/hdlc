@@ -4,6 +4,7 @@
 
 #include <M5Unified.h>
 #include <cstdio>
+#include <cstring>
 
 #define LOG_TAG "UiTask"
 #include "logger.h"
@@ -82,10 +83,15 @@ private:
         UiWakeupEventData latestWakeup = {};
         bool hasWakeup = false;
 
+        UiWifiStatusEventData latestWifiStatus = {};
+        bool hasWifiStatus = false;
+
         UiPowerInfoEvent renderedPowerInfo = {};
         bool renderedPowerInfoValid = false;
         UiWakeupEventData renderedWakeup = {};
         bool renderedWakeupValid = false;
+        UiWifiStatusEventData renderedWifiStatus = {};
+        bool renderedWifiStatusValid = false;
         bool renderedPowerInfoScreen = false;
 
         Screen screen = Screen::PowerInfo;
@@ -158,6 +164,24 @@ private:
         }
     }
 
+    static const char* wifiStateToString(UiWifiConnectionState state)
+    {
+        switch (state) {
+            case UiWifiConnectionState::IDLE:
+                return "idle";
+            case UiWifiConnectionState::CONNECTING:
+                return "connecting";
+            case UiWifiConnectionState::CONNECTED:
+                return "connected";
+            case UiWifiConnectionState::DISCONNECTED:
+                return "disconnected";
+            case UiWifiConnectionState::RECONNECTING:
+                return "reconnecting";
+            default:
+                return "unknown";
+        }
+    }
+
     static void sendPowerOffConfirmToPowerTask()
     {
         PowerEvent event = {};
@@ -221,6 +245,21 @@ private:
         std::snprintf(out, outSize, "SleepErr: %ld", static_cast<long>(wakeup->sleep_error));
     }
 
+    static void formatWifiLine(char* out, size_t outSize, const UiWifiStatusEventData* wifiStatus)
+    {
+        if (wifiStatus == nullptr) {
+            std::snprintf(out, outSize, "WiFi: n/a");
+            return;
+        }
+
+        if (wifiStatus->state == UiWifiConnectionState::CONNECTED && wifiStatus->ip_address[0] != '\0') {
+            std::snprintf(out, outSize, "WiFi IP: %s", wifiStatus->ip_address);
+            return;
+        }
+
+        std::snprintf(out, outSize, "WiFi: %s", wifiStateToString(wifiStatus->state));
+    }
+
     static void drawPowerInfoLine(int lineIndex, const char* text)
     {
         const int y = kOriginY + (lineIndex * kLineHeight);
@@ -248,7 +287,29 @@ private:
                || (newWakeup->sleep_error != renderedWakeup.sleep_error);
     }
 
-    void renderPowerInfo(const UiPowerInfoEvent& info, const UiWakeupEventData* wakeup, bool forceFullRedraw)
+    static bool wifiChanged(const UiWifiStatusEventData* newWifi,
+                            bool renderedWifiValid,
+                            const UiWifiStatusEventData& renderedWifi)
+    {
+        if (newWifi == nullptr) {
+            return renderedWifiValid;
+        }
+
+        if (!renderedWifiValid) {
+            return true;
+        }
+
+        return (newWifi->state != renderedWifi.state)
+               || (std::strncmp(newWifi->ip_address,
+                                renderedWifi.ip_address,
+                                sizeof(newWifi->ip_address))
+                   != 0);
+    }
+
+    void renderPowerInfo(const UiPowerInfoEvent& info,
+                         const UiWakeupEventData* wakeup,
+                         const UiWifiStatusEventData* wifiStatus,
+                         bool forceFullRedraw)
     {
         const bool powerChanged = !state_.renderedPowerInfoValid
                                   || (info.usb_powered != state_.renderedPowerInfo.usb_powered)
@@ -259,8 +320,11 @@ private:
                                   || (info.vbus_voltage_mv != state_.renderedPowerInfo.vbus_voltage_mv);
 
         const bool wakeChanged = wakeupChanged(wakeup, state_.renderedWakeupValid, state_.renderedWakeup);
+        const bool wifiStatusChanged = wifiChanged(wifiStatus,
+                                                   state_.renderedWifiStatusValid,
+                                                   state_.renderedWifiStatus);
 
-        if (!forceFullRedraw && !powerChanged && !wakeChanged) {
+        if (!forceFullRedraw && !powerChanged && !wakeChanged && !wifiStatusChanged) {
             return;
         }
 
@@ -298,6 +362,11 @@ private:
             drawPowerInfoLine(6, line);
         }
 
+        if (forceFullRedraw || wifiStatusChanged) {
+            formatWifiLine(line, sizeof(line), wifiStatus);
+            drawPowerInfoLine(7, line);
+        }
+
         M5.Display.endWrite();
 
         state_.renderedPowerInfo = info;
@@ -310,6 +379,14 @@ private:
             state_.renderedWakeup = {};
             state_.renderedWakeupValid = false;
         }
+
+        if (wifiStatus != nullptr) {
+            state_.renderedWifiStatus = *wifiStatus;
+            state_.renderedWifiStatusValid = true;
+        } else {
+            state_.renderedWifiStatus = {};
+            state_.renderedWifiStatusValid = false;
+        }
     }
 
     void resetPowerInfoRenderCache()
@@ -318,6 +395,8 @@ private:
         state_.renderedPowerInfoValid = false;
         state_.renderedWakeup = {};
         state_.renderedWakeupValid = false;
+        state_.renderedWifiStatus = {};
+        state_.renderedWifiStatusValid = false;
         state_.renderedPowerInfoScreen = false;
     }
 
@@ -354,8 +433,9 @@ private:
         }
 
         const UiWakeupEventData* wakeup = state_.hasWakeup ? &state_.latestWakeup : nullptr;
+        const UiWifiStatusEventData* wifiStatus = state_.hasWifiStatus ? &state_.latestWifiStatus : nullptr;
         const bool forceFullRedraw = !state_.renderedPowerInfoScreen;
-        renderPowerInfo(state_.latestPowerInfo, wakeup, forceFullRedraw);
+        renderPowerInfo(state_.latestPowerInfo, wakeup, wifiStatus, forceFullRedraw);
         state_.renderedPowerInfoScreen = true;
     }
 
@@ -412,6 +492,22 @@ private:
         }
     }
 
+    void handleWifiStatusEvent(const UiEvent& event)
+    {
+        UiWifiStatusEventData payload = {};
+        if (!uiTryGetEventData(event, payload)) {
+            LOGW("UI wifi status event has invalid payload size");
+            return;
+        }
+
+        state_.latestWifiStatus = payload;
+        state_.hasWifiStatus = true;
+
+        if (state_.screen == Screen::PowerInfo) {
+            renderPowerInfoScreen();
+        }
+    }
+
     void handleKeyEvent(const UiEvent& event)
     {
         UiKeyEventData payload = {};
@@ -438,6 +534,10 @@ private:
 
             case UiEventType::WAKEUP_EVENT:
                 handleWakeupEvent(event);
+                break;
+
+            case UiEventType::WIFI_STATUS:
+                handleWifiStatusEvent(event);
                 break;
 
             default:
