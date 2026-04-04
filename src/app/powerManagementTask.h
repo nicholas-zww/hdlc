@@ -14,14 +14,14 @@ enum class PowerKeyAction : uint8_t
 
 struct PowerKeyEventData
 {
-    PowerKeyAction action;
+    PowerKeyAction action = PowerKeyAction::POWEROFF_CONFIRM_YES;
 };
 
 struct PowerEvent
 {
-    PowerEventType type;
-    PowerKeyEventData key_event;
+    PowerEventType type = PowerEventType::KEY_EVENT;
+    PowerKeyEventData key_event = {};
 };
 
-bool startPowerManagementTask();
-bool postPowerEvent(const PowerEvent& event);
+[[nodiscard]] bool startPowerManagementTask();
+[[nodiscard]] bool postPowerEvent(const PowerEvent& event);

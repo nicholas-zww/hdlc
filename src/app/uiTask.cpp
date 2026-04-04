@@ -1,228 +1,492 @@
 #include "uiTask.h"
 #include "powerManagementTask.h"
 #include "osal/osal.h"
+
 #include <M5Unified.h>
+#include <cstdio>
 
 #define LOG_TAG "UiTask"
 #include "logger.h"
 
 namespace
 {
-constexpr size_t UI_EVENT_QUEUE_CAPACITY = 16;
-constexpr uint32_t UI_LOOP_MS = 50;
-static osalQueue_t uiEventQueue = {};
-static osalThread_t uiTaskThread = {};
-static bool uiQueueReady = false;
+constexpr size_t kEventQueueCapacity = 16;
+constexpr uint32_t kLoopMs = 50;
+constexpr uint32_t kColorBackground = 0x0000;
+constexpr uint32_t kColorForeground = 0xFFFF;
+constexpr int kOriginX = 8;
+constexpr int kOriginY = 8;
+constexpr int kLineHeight = 18;
 
 struct Rect
 {
-    int x;
-    int y;
-    int w;
-    int h;
+    int x = 0;
+    int y = 0;
+    int w = 0;
+    int h = 0;
+
+    [[nodiscard]] bool contains(int px, int py) const
+    {
+        return (px >= x && px < (x + w) && py >= y && py < (y + h));
+    }
 };
 
-constexpr Rect YES_BTN = { 40, 170, 100, 44 };
-constexpr Rect NO_BTN  = { 180, 170, 100, 44 };
+constexpr Rect kYesButton = {40, 170, 100, 44};
+constexpr Rect kNoButton = {180, 170, 100, 44};
 
-const char* chargePhaseToString(int8_t phase)
+class UiController
 {
-    switch (phase) {
-        case 1:
-            return "charging";
-        case 0:
-            return "standby_or_full";
-        case -1:
-            return "discharging";
-        default:
-            return "unknown";
-    }
-}
-
-bool pointInRect(int x, int y, const Rect& r)
-{
-    return (x >= r.x && x < (r.x + r.w) && y >= r.y && y < (r.y + r.h));
-}
-
-void renderPowerInfoToLcd(const UiPowerInfoEvent& info)
-{
-    constexpr uint32_t COLOR_BG = 0x0000;
-    constexpr uint32_t COLOR_FG = 0xFFFF;
-    constexpr int ORIGIN_X = 8;
-    constexpr int ORIGIN_Y = 8;
-    constexpr int LINE_H = 18;
-
-    M5.Display.startWrite();
-    M5.Display.fillScreen(COLOR_BG);
-    M5.Display.setTextColor(COLOR_FG, COLOR_BG);
-    M5.Display.setTextSize(1);
-
-    int y = ORIGIN_Y;
-    M5.Display.setCursor(ORIGIN_X, y);
-    M5.Display.printf("Power: %s", info.usb_powered ? "USB" : "BATTERY");
-    y += LINE_H;
-
-    M5.Display.setCursor(ORIGIN_X, y);
-    M5.Display.printf("Phase: %s", chargePhaseToString(info.charge_phase));
-    y += LINE_H;
-
-    M5.Display.setCursor(ORIGIN_X, y);
-    M5.Display.printf("Charge Enable: %s", info.charge_enabled ? "YES" : "NO");
-    y += LINE_H;
-
-    M5.Display.setCursor(ORIGIN_X, y);
-    M5.Display.printf("Battery: %ld%%  %dmV",
-                      static_cast<long>(info.battery_level_percent),
-                      static_cast<int>(info.battery_voltage_mv));
-    y += LINE_H;
-
-    M5.Display.setCursor(ORIGIN_X, y);
-    M5.Display.printf("VBUS: %dmV", static_cast<int>(info.vbus_voltage_mv));
-
-    M5.Display.endWrite();
-}
-
-void renderPowerOffConfirm()
-{
-    constexpr uint32_t COLOR_BG = 0x0000;
-    constexpr uint32_t COLOR_FG = 0xFFFF;
-
-    M5.Display.startWrite();
-    M5.Display.fillScreen(COLOR_BG);
-    M5.Display.setTextColor(COLOR_FG, COLOR_BG);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(16, 36);
-    M5.Display.print("Power Off?");
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(16, 80);
-    M5.Display.print("Hold power key detected.");
-    M5.Display.setCursor(16, 100);
-    M5.Display.print("Do you want to shut down?");
-
-    M5.Display.drawRect(YES_BTN.x, YES_BTN.y, YES_BTN.w, YES_BTN.h, COLOR_FG);
-    M5.Display.drawRect(NO_BTN.x, NO_BTN.y, NO_BTN.w, NO_BTN.h, COLOR_FG);
-    M5.Display.setCursor(YES_BTN.x + 34, YES_BTN.y + 14);
-    M5.Display.print("YES");
-    M5.Display.setCursor(NO_BTN.x + 38, NO_BTN.y + 14);
-    M5.Display.print("NO");
-    M5.Display.endWrite();
-}
-
-void sendPowerOffConfirmToPowerTask()
-{
-    PowerEvent event = {};
-    event.type = PowerEventType::KEY_EVENT;
-    event.key_event.action = PowerKeyAction::POWEROFF_CONFIRM_YES;
-    if (!postPowerEvent(event)) {
-        LOGW("Failed to post power-off confirm event");
-    }
-}
-
-void uiTask(void* context)
-{
-    (void)context;
-
-    UiEvent event = {};
-    UiPowerInfoEvent latestPowerInfo = {};
-    bool hasPowerInfo = false;
-    bool showPowerOffConfirmScreen = false;
-    bool touchWasDown = false;
-
-    while (true) {
-        if (osalQueueReceive(&uiEventQueue, &event, UI_LOOP_MS) == OSAL_STATUS_OK) {
-            switch (event.type) {
-                case UiEventType::POWER_INFO:
-                {
-                    const UiPowerInfoEvent* powerInfo = uiGetEventData<UiPowerInfoEvent>(event);
-                    if (powerInfo == nullptr) {
-                        LOGW("UI power event has invalid payload size");
-                        break;
-                    }
-
-                    latestPowerInfo = *powerInfo;
-                    hasPowerInfo = true;
-                    if (!showPowerOffConfirmScreen) {
-                        renderPowerInfoToLcd(latestPowerInfo);
-                    }
-                    break;
-                }
-                case UiEventType::KEY_EVENT:
-                {
-                    const UiKeyEventData* keyEvent = uiGetEventData<UiKeyEventData>(event);
-                    if (keyEvent == nullptr) {
-                        LOGW("UI key event has invalid payload size");
-                        break;
-                    }
-                    if (keyEvent->key_id == UiKeyId::POWER
-                        && keyEvent->action == UiKeyAction::LONG_PRESS) {
-                        showPowerOffConfirmScreen = true;
-                        renderPowerOffConfirm();
-                    }
-                    break;
-                }
-                default:
-                    LOGW("UI received unknown event type");
-                    break;
-            }
+public:
+    [[nodiscard]] bool start()
+    {
+        if (!ensureQueueReady()) {
+            return false;
         }
 
-        if (!showPowerOffConfirmScreen) {
-            touchWasDown = false;
-            continue;
+        const osalThreadAttr_t uiTaskAttr = {
+            .stack_size_bytes = 4096,
+            .priority = 7,
+            .detached = true,
+            .name = "UiTask",
+        };
+
+        if (osalThreadCreate(&taskThread_, UiController::taskEntry, this, &uiTaskAttr) != OSAL_STATUS_OK) {
+            LOGE("Failed to create UiTask");
+            return false;
+        }
+
+        LOGI("UiTask started");
+        return true;
+    }
+
+    [[nodiscard]] bool postEvent(const UiEvent& event)
+    {
+        if (!queueReady_) {
+            return false;
+        }
+        return osalQueueSend(&eventQueue_, &event, 0) == OSAL_STATUS_OK;
+    }
+
+private:
+    enum class Screen : uint8_t
+    {
+        PowerInfo,
+        PowerOffConfirm,
+    };
+
+    struct State
+    {
+        UiPowerInfoEvent latestPowerInfo = {};
+        bool hasPowerInfo = false;
+
+        UiWakeupEventData latestWakeup = {};
+        bool hasWakeup = false;
+
+        UiPowerInfoEvent renderedPowerInfo = {};
+        bool renderedPowerInfoValid = false;
+        UiWakeupEventData renderedWakeup = {};
+        bool renderedWakeupValid = false;
+        bool renderedPowerInfoScreen = false;
+
+        Screen screen = Screen::PowerInfo;
+        bool touchWasDown = false;
+    };
+
+    static void taskEntry(void* context)
+    {
+        auto* self = static_cast<UiController*>(context);
+        if (self != nullptr) {
+            self->taskLoop();
+        }
+    }
+
+    void taskLoop()
+    {
+        state_ = {};
+        UiEvent event = {};
+
+        while (true) {
+            if (osalQueueReceive(&eventQueue_, &event, kLoopMs) == OSAL_STATUS_OK) {
+                handleEvent(event);
+            }
+
+            handlePowerOffConfirmTouch();
+        }
+    }
+
+    [[nodiscard]] bool ensureQueueReady()
+    {
+        if (queueReady_) {
+            return true;
+        }
+
+        if (osalQueueInit(&eventQueue_, sizeof(UiEvent), kEventQueueCapacity) != OSAL_STATUS_OK) {
+            LOGE("Failed to create UI event queue");
+            return false;
+        }
+
+        queueReady_ = true;
+        return true;
+    }
+
+    static const char* chargePhaseToString(int8_t phase)
+    {
+        switch (phase) {
+            case 1:
+                return "charging";
+            case 0:
+                return "standby_or_full";
+            case -1:
+                return "discharging";
+            default:
+                return "unknown";
+        }
+    }
+
+    static const char* wakeupSourceToString(UiWakeupSource source)
+    {
+        switch (source) {
+            case UiWakeupSource::GPIO:
+                return "gpio";
+            case UiWakeupSource::TIMER:
+                return "timer";
+            case UiWakeupSource::OTHER:
+                return "other";
+            case UiWakeupSource::UNKNOWN:
+            default:
+                return "unknown";
+        }
+    }
+
+    static void sendPowerOffConfirmToPowerTask()
+    {
+        PowerEvent event = {};
+        event.type = PowerEventType::KEY_EVENT;
+        event.key_event.action = PowerKeyAction::POWEROFF_CONFIRM_YES;
+        if (!postPowerEvent(event)) {
+            LOGW("Failed to post power-off confirm event");
+        }
+    }
+
+    static void formatPowerLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
+    {
+        std::snprintf(out, outSize, "Power: %s", info.usb_powered ? "USB" : "BATTERY");
+    }
+
+    static void formatPhaseLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
+    {
+        std::snprintf(out, outSize, "Phase: %s", chargePhaseToString(info.charge_phase));
+    }
+
+    static void formatChargeEnableLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
+    {
+        std::snprintf(out, outSize, "Charge Enable: %s", info.charge_enabled ? "YES" : "NO");
+    }
+
+    static void formatBatteryLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
+    {
+        std::snprintf(out,
+                      outSize,
+                      "Battery: %ld%%  %dmV",
+                      static_cast<long>(info.battery_level_percent),
+                      static_cast<int>(info.battery_voltage_mv));
+    }
+
+    static void formatVbusLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
+    {
+        std::snprintf(out, outSize, "VBUS: %dmV", static_cast<int>(info.vbus_voltage_mv));
+    }
+
+    static void formatWakeLine(char* out, size_t outSize, const UiWakeupEventData* wakeup)
+    {
+        if (wakeup == nullptr) {
+            std::snprintf(out, outSize, "Wake: n/a");
+            return;
+        }
+
+        std::snprintf(out,
+                      outSize,
+                      "Wake: %s (cause=%ld)",
+                      wakeupSourceToString(wakeup->source),
+                      static_cast<long>(wakeup->wakeup_cause));
+    }
+
+    static void formatSleepErrorLine(char* out, size_t outSize, const UiWakeupEventData* wakeup)
+    {
+        if (wakeup == nullptr) {
+            std::snprintf(out, outSize, "SleepErr: n/a");
+            return;
+        }
+
+        std::snprintf(out, outSize, "SleepErr: %ld", static_cast<long>(wakeup->sleep_error));
+    }
+
+    static void drawPowerInfoLine(int lineIndex, const char* text)
+    {
+        const int y = kOriginY + (lineIndex * kLineHeight);
+        int lineWidth = M5.Display.width() - (kOriginX * 2);
+        if (lineWidth <= 0) {
+            lineWidth = M5.Display.width();
+        }
+        M5.Display.fillRect(kOriginX, y, lineWidth, kLineHeight, kColorBackground);
+        M5.Display.setCursor(kOriginX, y);
+        M5.Display.print(text);
+    }
+
+    static bool wakeupChanged(const UiWakeupEventData* newWakeup,
+                              bool renderedWakeupValid,
+                              const UiWakeupEventData& renderedWakeup)
+    {
+        if (newWakeup == nullptr) {
+            return renderedWakeupValid;
+        }
+        if (!renderedWakeupValid) {
+            return true;
+        }
+        return (newWakeup->source != renderedWakeup.source)
+               || (newWakeup->wakeup_cause != renderedWakeup.wakeup_cause)
+               || (newWakeup->sleep_error != renderedWakeup.sleep_error);
+    }
+
+    void renderPowerInfo(const UiPowerInfoEvent& info, const UiWakeupEventData* wakeup, bool forceFullRedraw)
+    {
+        const bool powerChanged = !state_.renderedPowerInfoValid
+                                  || (info.usb_powered != state_.renderedPowerInfo.usb_powered)
+                                  || (info.charge_phase != state_.renderedPowerInfo.charge_phase)
+                                  || (info.charge_enabled != state_.renderedPowerInfo.charge_enabled)
+                                  || (info.battery_level_percent != state_.renderedPowerInfo.battery_level_percent)
+                                  || (info.battery_voltage_mv != state_.renderedPowerInfo.battery_voltage_mv)
+                                  || (info.vbus_voltage_mv != state_.renderedPowerInfo.vbus_voltage_mv);
+
+        const bool wakeChanged = wakeupChanged(wakeup, state_.renderedWakeupValid, state_.renderedWakeup);
+
+        if (!forceFullRedraw && !powerChanged && !wakeChanged) {
+            return;
+        }
+
+        M5.Display.startWrite();
+        M5.Display.setTextColor(kColorForeground, kColorBackground);
+        M5.Display.setTextSize(1);
+
+        if (forceFullRedraw) {
+            M5.Display.fillScreen(kColorBackground);
+        }
+
+        char line[64] = {};
+        if (forceFullRedraw || powerChanged) {
+            formatPowerLine(line, sizeof(line), info);
+            drawPowerInfoLine(0, line);
+
+            formatPhaseLine(line, sizeof(line), info);
+            drawPowerInfoLine(1, line);
+
+            formatChargeEnableLine(line, sizeof(line), info);
+            drawPowerInfoLine(2, line);
+
+            formatBatteryLine(line, sizeof(line), info);
+            drawPowerInfoLine(3, line);
+
+            formatVbusLine(line, sizeof(line), info);
+            drawPowerInfoLine(4, line);
+        }
+
+        if (forceFullRedraw || wakeChanged) {
+            formatWakeLine(line, sizeof(line), wakeup);
+            drawPowerInfoLine(5, line);
+
+            formatSleepErrorLine(line, sizeof(line), wakeup);
+            drawPowerInfoLine(6, line);
+        }
+
+        M5.Display.endWrite();
+
+        state_.renderedPowerInfo = info;
+        state_.renderedPowerInfoValid = true;
+
+        if (wakeup != nullptr) {
+            state_.renderedWakeup = *wakeup;
+            state_.renderedWakeupValid = true;
+        } else {
+            state_.renderedWakeup = {};
+            state_.renderedWakeupValid = false;
+        }
+    }
+
+    void resetPowerInfoRenderCache()
+    {
+        state_.renderedPowerInfo = {};
+        state_.renderedPowerInfoValid = false;
+        state_.renderedWakeup = {};
+        state_.renderedWakeupValid = false;
+        state_.renderedPowerInfoScreen = false;
+    }
+
+    void renderPowerOffConfirm()
+    {
+        constexpr uint32_t kColorBackground = 0x0000;
+        constexpr uint32_t kColorForeground = 0xFFFF;
+
+        M5.Display.startWrite();
+        M5.Display.fillScreen(kColorBackground);
+        M5.Display.setTextColor(kColorForeground, kColorBackground);
+        M5.Display.setTextSize(2);
+        M5.Display.setCursor(16, 36);
+        M5.Display.print("Power Off?");
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(16, 80);
+        M5.Display.print("Hold power key detected.");
+        M5.Display.setCursor(16, 100);
+        M5.Display.print("Do you want to shut down?");
+
+        M5.Display.drawRect(kYesButton.x, kYesButton.y, kYesButton.w, kYesButton.h, kColorForeground);
+        M5.Display.drawRect(kNoButton.x, kNoButton.y, kNoButton.w, kNoButton.h, kColorForeground);
+        M5.Display.setCursor(kYesButton.x + 34, kYesButton.y + 14);
+        M5.Display.print("YES");
+        M5.Display.setCursor(kNoButton.x + 38, kNoButton.y + 14);
+        M5.Display.print("NO");
+        M5.Display.endWrite();
+    }
+
+    void renderPowerInfoScreen()
+    {
+        if (!state_.hasPowerInfo) {
+            return;
+        }
+
+        const UiWakeupEventData* wakeup = state_.hasWakeup ? &state_.latestWakeup : nullptr;
+        const bool forceFullRedraw = !state_.renderedPowerInfoScreen;
+        renderPowerInfo(state_.latestPowerInfo, wakeup, forceFullRedraw);
+        state_.renderedPowerInfoScreen = true;
+    }
+
+    void showPowerInfoScreen()
+    {
+        state_.screen = Screen::PowerInfo;
+        state_.touchWasDown = false;
+        resetPowerInfoRenderCache();
+        renderPowerInfoScreen();
+    }
+
+    void showPowerOffConfirmScreen()
+    {
+        state_.screen = Screen::PowerOffConfirm;
+        state_.touchWasDown = false;
+        state_.renderedPowerInfoScreen = false;
+        renderPowerOffConfirm();
+    }
+
+    void handlePowerInfoEvent(const UiEvent& event)
+    {
+        UiPowerInfoEvent payload = {};
+        if (!uiTryGetEventData(event, payload)) {
+            LOGW("UI power event has invalid payload size");
+            return;
+        }
+
+        state_.latestPowerInfo = payload;
+        state_.hasPowerInfo = true;
+
+        if (state_.screen == Screen::PowerInfo) {
+            renderPowerInfoScreen();
+        }
+    }
+
+    void handleWakeupEvent(const UiEvent& event)
+    {
+        UiWakeupEventData payload = {};
+        if (!uiTryGetEventData(event, payload)) {
+            LOGW("UI wakeup event has invalid payload size");
+            return;
+        }
+
+        state_.latestWakeup = payload;
+        state_.hasWakeup = true;
+
+        LOGI("Wakeup event received: source=%u cause=%ld sleepErr=%ld",
+             static_cast<unsigned>(payload.source),
+             static_cast<long>(payload.wakeup_cause),
+             static_cast<long>(payload.sleep_error));
+
+        if (state_.screen == Screen::PowerInfo) {
+            renderPowerInfoScreen();
+        }
+    }
+
+    void handleKeyEvent(const UiEvent& event)
+    {
+        UiKeyEventData payload = {};
+        if (!uiTryGetEventData(event, payload)) {
+            LOGW("UI key event has invalid payload size");
+            return;
+        }
+
+        if (payload.key_id == UiKeyId::POWER && payload.action == UiKeyAction::LONG_PRESS) {
+            showPowerOffConfirmScreen();
+        }
+    }
+
+    void handleEvent(const UiEvent& event)
+    {
+        switch (event.type) {
+            case UiEventType::POWER_INFO:
+                handlePowerInfoEvent(event);
+                break;
+
+            case UiEventType::KEY_EVENT:
+                handleKeyEvent(event);
+                break;
+
+            case UiEventType::WAKEUP_EVENT:
+                handleWakeupEvent(event);
+                break;
+
+            default:
+                LOGW("UI received unknown event type");
+                break;
+        }
+    }
+
+    void handlePowerOffConfirmTouch()
+    {
+        if (state_.screen != Screen::PowerOffConfirm) {
+            state_.touchWasDown = false;
+            return;
         }
 
         int32_t tx = 0;
         int32_t ty = 0;
         const bool touchDown = M5.Display.getTouch(&tx, &ty) > 0;
-        if (touchDown && !touchWasDown) {
-            if (pointInRect(static_cast<int>(tx), static_cast<int>(ty), YES_BTN)) {
+
+        if (touchDown && !state_.touchWasDown) {
+            const int touchX = static_cast<int>(tx);
+            const int touchY = static_cast<int>(ty);
+
+            if (kYesButton.contains(touchX, touchY)) {
                 sendPowerOffConfirmToPowerTask();
-                showPowerOffConfirmScreen = false;
-                if (hasPowerInfo) {
-                    renderPowerInfoToLcd(latestPowerInfo);
-                }
-            } else if (pointInRect(static_cast<int>(tx), static_cast<int>(ty), NO_BTN)) {
-                showPowerOffConfirmScreen = false;
-                if (hasPowerInfo) {
-                    renderPowerInfoToLcd(latestPowerInfo);
-                }
+                showPowerInfoScreen();
+            } else if (kNoButton.contains(touchX, touchY)) {
+                showPowerInfoScreen();
             }
         }
-        touchWasDown = touchDown;
+
+        state_.touchWasDown = touchDown;
     }
-}
+
+    osalQueue_t eventQueue_ = {};
+    osalThread_t taskThread_ = {};
+    bool queueReady_ = false;
+    State state_ = {};
+};
+
+UiController gUiController = {};
 } // namespace
 
 bool startUiTask()
 {
-    if (!uiQueueReady) {
-        if (osalQueueInit(&uiEventQueue, sizeof(UiEvent), UI_EVENT_QUEUE_CAPACITY) != OSAL_STATUS_OK) {
-            LOGE("Failed to create UI event queue");
-            return false;
-        }
-        uiQueueReady = true;
-    }
-
-    const osalThreadAttr_t uiTaskAttr = {
-        .stack_size_bytes = 4096,
-        .priority = 7,
-        .detached = true,
-        .name = "UiTask",
-    };
-
-    if (osalThreadCreate(&uiTaskThread, uiTask, nullptr, &uiTaskAttr) != OSAL_STATUS_OK) {
-        LOGE("Failed to create UiTask");
-        return false;
-    }
-
-    LOGI("UiTask started");
-    return true;
+    return gUiController.start();
 }
 
 bool uiPostEvent(const UiEvent& event)
 {
-    if (!uiQueueReady) {
-        return false;
-    }
-    return osalQueueSend(&uiEventQueue, &event, 0) == OSAL_STATUS_OK;
+    return gUiController.postEvent(event);
 }

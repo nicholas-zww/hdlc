@@ -9,6 +9,7 @@ enum class UiEventType : uint8_t
 {
     POWER_INFO = 0,
     KEY_EVENT = 1,
+    WAKEUP_EVENT = 2,
 };
 
 enum class UiKeyId : uint8_t
@@ -23,41 +24,56 @@ enum class UiKeyAction : uint8_t
 
 struct UiPowerInfoEvent
 {
-    bool usb_powered;
-    bool charge_enabled;
-    bool battery_present;
-    int8_t charge_phase;  // -1=discharging, 0=standby/full, 1=charging
-    int16_t vbus_voltage_mv;
-    int16_t battery_voltage_mv;
-    int32_t battery_level_percent;
-    int32_t battery_current_ma;
-    int32_t charging_current_ma;
+    bool usb_powered = false;
+    bool charge_enabled = false;
+    bool battery_present = false;
+    int8_t charge_phase = 0;  // -1=discharging, 0=standby/full, 1=charging
+    int16_t vbus_voltage_mv = 0;
+    int16_t battery_voltage_mv = 0;
+    int32_t battery_level_percent = 0;
+    int32_t battery_current_ma = 0;
+    int32_t charging_current_ma = 0;
 };
 
 struct UiKeyEventData
 {
-    UiKeyId key_id;
-    UiKeyAction action;
+    UiKeyId key_id = UiKeyId::POWER;
+    UiKeyAction action = UiKeyAction::LONG_PRESS;
+};
+
+enum class UiWakeupSource : uint8_t
+{
+    UNKNOWN = 0,
+    GPIO = 1,
+    TIMER = 2,
+    OTHER = 3,
+};
+
+struct UiWakeupEventData
+{
+    UiWakeupSource source = UiWakeupSource::UNKNOWN;
+    int32_t wakeup_cause = 0;
+    int32_t sleep_error = 0;
 };
 
 constexpr size_t UI_EVENT_DATA_MAX_SIZE = 64;
 
 struct UiEventData
 {
-    uint16_t size;
-    alignas(std::max_align_t) uint8_t bytes[UI_EVENT_DATA_MAX_SIZE];
+    uint16_t size = 0;
+    alignas(std::max_align_t) uint8_t bytes[UI_EVENT_DATA_MAX_SIZE] = {};
 };
 
 struct UiEvent
 {
-    UiEventType type;
-    UiEventData data;
+    UiEventType type = UiEventType::POWER_INFO;
+    UiEventData data = {};
 };
 
 template <typename T>
 bool uiSetEventData(UiEvent& event, const T& value)
 {
-    static_assert(std::is_trivially_copyable<T>::value, "UiEvent data must be trivially copyable");
+    static_assert(std::is_trivially_copyable_v<T>, "UiEvent data must be trivially copyable");
     if (sizeof(T) > UI_EVENT_DATA_MAX_SIZE) {
         return false;
     }
@@ -69,12 +85,25 @@ bool uiSetEventData(UiEvent& event, const T& value)
 template <typename T>
 const T* uiGetEventData(const UiEvent& event)
 {
-    static_assert(std::is_trivially_copyable<T>::value, "UiEvent data must be trivially copyable");
+    static_assert(std::is_trivially_copyable_v<T>, "UiEvent data must be trivially copyable");
+    static thread_local T value = {};
     if (event.data.size != sizeof(T)) {
         return nullptr;
     }
-    return reinterpret_cast<const T*>(event.data.bytes);
+    std::memcpy(&value, event.data.bytes, sizeof(T));
+    return &value;
 }
 
-bool startUiTask();
-bool uiPostEvent(const UiEvent& event);
+template <typename T>
+bool uiTryGetEventData(const UiEvent& event, T& out)
+{
+    static_assert(std::is_trivially_copyable_v<T>, "UiEvent data must be trivially copyable");
+    if (event.data.size != sizeof(T)) {
+        return false;
+    }
+    std::memcpy(&out, event.data.bytes, sizeof(T));
+    return true;
+}
+
+[[nodiscard]] bool startUiTask();
+[[nodiscard]] bool uiPostEvent(const UiEvent& event);
