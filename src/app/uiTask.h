@@ -11,6 +11,7 @@ enum class UiEventType : uint8_t
     KEY_EVENT = 1,
     WAKEUP_EVENT = 2,
     WIFI_STATUS = 3,
+    DISPLAY_POWER = 4,
 };
 
 enum class UiKeyId : uint8_t
@@ -70,6 +71,17 @@ struct UiWifiStatusEventData
 {
     UiWifiConnectionState state = UiWifiConnectionState::IDLE;
     char ip_address[16] = {};
+};
+
+enum class UiDisplayPowerAction : uint8_t
+{
+    SLEEP = 0,
+    WAKE = 1,
+};
+
+struct UiDisplayPowerEventData
+{
+    UiDisplayPowerAction action = UiDisplayPowerAction::WAKE;
 };
 
 constexpr size_t UI_EVENT_DATA_MAX_SIZE = 64;

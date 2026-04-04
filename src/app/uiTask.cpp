@@ -15,6 +15,7 @@ constexpr size_t kEventQueueCapacity = 16;
 constexpr uint32_t kLoopMs = 50;
 constexpr uint32_t kColorBackground = 0x0000;
 constexpr uint32_t kColorForeground = 0xFFFF;
+constexpr uint8_t kDisplayRotation = 3;  // 180 degree rotation
 constexpr int kOriginX = 8;
 constexpr int kOriginY = 8;
 constexpr int kLineHeight = 18;
@@ -43,6 +44,8 @@ public:
         if (!ensureQueueReady()) {
             return false;
         }
+
+        initializeDisplay();
 
         const osalThreadAttr_t uiTaskAttr = {
             .stack_size_bytes = 4096,
@@ -96,6 +99,7 @@ private:
 
         Screen screen = Screen::PowerInfo;
         bool touchWasDown = false;
+        bool displaySleeping = false;
     };
 
     static void taskEntry(void* context)
@@ -180,6 +184,16 @@ private:
             default:
                 return "unknown";
         }
+    }
+
+    static void initializeDisplay()
+    {
+        auto cfg = M5.config();
+        cfg.clear_display = false;
+        cfg.fallback_board = m5::board_t::board_M5StackCoreS3;
+        cfg.output_power = false;
+        M5.begin(cfg);
+        M5.Display.setRotation(kDisplayRotation);
     }
 
     static void sendPowerOffConfirmToPowerTask()
@@ -508,6 +522,49 @@ private:
         }
     }
 
+    void sleepDisplayIfNeeded()
+    {
+        if (state_.displaySleeping) {
+            return;
+        }
+
+        M5.Display.sleep();
+        M5.Display.waitDisplay();
+        state_.displaySleeping = true;
+    }
+
+    void wakeDisplayIfNeeded()
+    {
+        if (!state_.displaySleeping) {
+            return;
+        }
+
+        M5.Display.wakeup();
+        state_.displaySleeping = false;
+
+        if (state_.screen == Screen::PowerInfo) {
+            resetPowerInfoRenderCache();
+            renderPowerInfoScreen();
+        } else {
+            renderPowerOffConfirm();
+        }
+    }
+
+    void handleDisplayPowerEvent(const UiEvent& event)
+    {
+        UiDisplayPowerEventData payload = {};
+        if (!uiTryGetEventData(event, payload)) {
+            LOGW("UI display power event has invalid payload size");
+            return;
+        }
+
+        if (payload.action == UiDisplayPowerAction::SLEEP) {
+            sleepDisplayIfNeeded();
+        } else {
+            wakeDisplayIfNeeded();
+        }
+    }
+
     void handleKeyEvent(const UiEvent& event)
     {
         UiKeyEventData payload = {};
@@ -540,6 +597,10 @@ private:
                 handleWifiStatusEvent(event);
                 break;
 
+            case UiEventType::DISPLAY_POWER:
+                handleDisplayPowerEvent(event);
+                break;
+
             default:
                 LOGW("UI received unknown event type");
                 break;
@@ -548,6 +609,11 @@ private:
 
     void handlePowerOffConfirmTouch()
     {
+        if (state_.displaySleeping) {
+            state_.touchWasDown = false;
+            return;
+        }
+
         if (state_.screen != Screen::PowerOffConfirm) {
             state_.touchWasDown = false;
             return;

@@ -21,7 +21,11 @@ constexpr uint32_t kPowerKeyHoldMs = 3000;
 constexpr uint32_t kPowerIdleSleepTimeoutMs = 60000;
 constexpr uint32_t kPowerLightSleepPollWakeMs = 500;
 constexpr uint32_t kPowerSleepRetryBackoffMs = 2000;
-constexpr float kImuActivityDeltaG = 0.25f;
+constexpr bool kPowerUseDeepSleepWhenWakeGpioReady = true;
+constexpr float kImuActivityDeltaAbsG = 0.12f;
+constexpr float kImuActivityDeltaVecG = 0.08f;
+constexpr float kImuActivityAccumulatedThresholdG = 0.20f;
+constexpr float kImuActivityAccumulatorDecay = 0.85f;
 constexpr size_t kPowerEventQueueCapacity = 8;
 
 constexpr uint8_t kAw9523Addr = 0x58;
@@ -85,6 +89,7 @@ struct ImuMotionTracker
     float ax = 0.0f;
     float ay = 0.0f;
     float az = 0.0f;
+    float accumulatedDelta = 0.0f;
 };
 
 struct IdleSleepResult
@@ -136,7 +141,6 @@ struct PowerTaskState
     uint32_t nextSleepAttemptMs = 0;
     ImuMotionTracker imuMotionTracker = {};
     bool idleSleepLogged = false;
-    bool displaySleeping = false;
 };
 
 class PowerManager
@@ -147,12 +151,6 @@ public:
         if (!ensureEventQueueReady()) {
             return false;
         }
-
-        auto cfg = M5.config();
-        cfg.clear_display = false;
-        cfg.fallback_board = m5::board_t::board_M5StackCoreS3;
-        cfg.output_power = false;
-        M5.begin(cfg);
 
         forceDisableCoreS3BackPower();
         M5.Power.setExtOutput(false);
@@ -291,6 +289,19 @@ private:
         }
     }
 
+    static void requestUiDisplayPower(UiDisplayPowerAction action)
+    {
+        UiEvent event = {};
+        event.type = UiEventType::DISPLAY_POWER;
+
+        UiDisplayPowerEventData payload = {};
+        payload.action = action;
+
+        if (!uiSetEventData(event, payload) || !uiPostEvent(event)) {
+            LOGW("Failed to post display power event to UI");
+        }
+    }
+
     static bool detectUiActivity()
     {
         return (M5.Touch.isEnabled() && (M5.Touch.getCount() > 0))
@@ -318,16 +329,33 @@ private:
             state_.imuMotionTracker.ax = ax;
             state_.imuMotionTracker.ay = ay;
             state_.imuMotionTracker.az = az;
+            state_.imuMotionTracker.accumulatedDelta = 0.0f;
             return false;
         }
 
-        const float delta = std::fabs(ax - state_.imuMotionTracker.ax)
-                          + std::fabs(ay - state_.imuMotionTracker.ay)
-                          + std::fabs(az - state_.imuMotionTracker.az);
+        const float dx = std::fabs(ax - state_.imuMotionTracker.ax);
+        const float dy = std::fabs(ay - state_.imuMotionTracker.ay);
+        const float dz = std::fabs(az - state_.imuMotionTracker.az);
+        const float deltaAbs = dx + dy + dz;
+        const float deltaVec = std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+
+        state_.imuMotionTracker.accumulatedDelta =
+            (state_.imuMotionTracker.accumulatedDelta * kImuActivityAccumulatorDecay) + deltaAbs;
+
         state_.imuMotionTracker.ax = ax;
         state_.imuMotionTracker.ay = ay;
         state_.imuMotionTracker.az = az;
-        return delta >= kImuActivityDeltaG;
+
+        const bool motionDetected =
+            (deltaAbs >= kImuActivityDeltaAbsG)
+            || (deltaVec >= kImuActivityDeltaVecG)
+            || (state_.imuMotionTracker.accumulatedDelta >= kImuActivityAccumulatedThresholdG);
+
+        if (motionDetected) {
+            state_.imuMotionTracker.accumulatedDelta = 0.0f;
+        }
+
+        return motionDetected;
     }
 
     static void armWakeGpio(gpio_num_t pin, bool& armed)
@@ -358,6 +386,15 @@ private:
         gpio_wakeup_disable(pin);
     }
 
+    static bool isWakePinHigh(gpio_num_t pin)
+    {
+        if (pin >= GPIO_NUM_MAX) {
+            return false;
+        }
+        m5gfx::pinMode(pin, m5gfx::pin_mode_t::input_pullup);
+        return gpio_get_level(pin) != 0;
+    }
+
     void clearCoreS3InterruptLatch()
     {
         // AW9523 INT is level-latched; read input ports to release pending IRQ.
@@ -370,6 +407,31 @@ private:
         IdleSleepResult result = {};
         esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
         clearCoreS3InterruptLatch();
+
+        const bool imuWakePinHigh = isWakePinHigh(kCoreS3ImuIrqGpio);
+        const bool buttonWakePinHigh = (kCoreS3ButtonIrqGpio == kCoreS3ImuIrqGpio)
+                                       ? imuWakePinHigh
+                                       : isWakePinHigh(kCoreS3ButtonIrqGpio);
+        const bool wakePinsReady = imuWakePinHigh || buttonWakePinHigh;
+
+        if (kPowerUseDeepSleepWhenWakeGpioReady && wakePinsReady) {
+            const gpio_num_t deepWakePin = imuWakePinHigh ? kCoreS3ImuIrqGpio : kCoreS3ButtonIrqGpio;
+            const esp_err_t ext0Err = esp_sleep_enable_ext0_wakeup(deepWakePin, 0);
+            if (ext0Err == ESP_OK) {
+                requestUiDisplayPower(UiDisplayPowerAction::SLEEP);
+
+                LOGI("Idle for %u ms; entering deep sleep via GPIO%d",
+                     static_cast<unsigned>(kPowerIdleSleepTimeoutMs),
+                     static_cast<int>(deepWakePin));
+                osalThreadSleepMs(20);
+                esp_deep_sleep_start();
+            } else {
+                LOGW("Failed to enable ext0 deep sleep wakeup on GPIO%d: %d",
+                     static_cast<int>(deepWakePin),
+                     static_cast<int>(ext0Err));
+                esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            }
+        }
 
         bool gpioWakeArmed = false;
         armWakeGpio(kCoreS3ImuIrqGpio, gpioWakeArmed);
@@ -387,11 +449,7 @@ private:
             esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(kPowerLightSleepPollWakeMs) * 1000ULL);
         }
 
-        if (!state_.displaySleeping) {
-            M5.Display.sleep();
-            M5.Display.waitDisplay();
-            state_.displaySleeping = true;
-        }
+        requestUiDisplayPower(UiDisplayPowerAction::SLEEP);
 
         result.sleepErr = esp_light_sleep_start();
 
@@ -409,7 +467,7 @@ private:
 
         const bool timerFallbackWake = result.timerWakeEnabled && result.wakeCause == ESP_SLEEP_WAKEUP_TIMER;
         if (result.sleepErr != ESP_OK || !timerFallbackWake) {
-            wakeDisplayIfNeeded();
+            requestUiDisplayPower(UiDisplayPowerAction::WAKE);
         }
 
         if (!timerFallbackWake) {
@@ -602,20 +660,12 @@ private:
         return readings;
     }
 
-    void wakeDisplayIfNeeded()
-    {
-        if (state_.displaySleeping) {
-            M5.Display.wakeup();
-            state_.displaySleeping = false;
-        }
-    }
-
     void markActivity(uint32_t nowMs)
     {
         state_.lastActivityMs = nowMs;
         state_.nextSleepAttemptMs = 0;
         state_.idleSleepLogged = false;
-        wakeDisplayIfNeeded();
+        requestUiDisplayPower(UiDisplayPowerAction::WAKE);
     }
 
     bool handleIdleSleep(uint32_t nowMs)
