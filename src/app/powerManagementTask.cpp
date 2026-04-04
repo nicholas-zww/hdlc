@@ -36,6 +36,7 @@ constexpr uint8_t kCoreS3BoostEnableBit = 0x80;
 constexpr uint32_t kPowerI2cFreq = 100000;
 constexpr uint8_t kAxp2101ChargeControlReg = 0x18;
 constexpr uint8_t kBackfeedDischargeThreshold = 2;
+constexpr uint32_t kPowerIdleBlockedRetryMs = 1000;
 
 // On CoreS3 this is the shared interrupt line from AW9523 ("I2C_INT").
 // If a board revision routes IMU/PWR IRQ into this line, light sleep can wake directly.
@@ -141,6 +142,7 @@ struct PowerTaskState
     uint32_t nextSleepAttemptMs = 0;
     ImuMotionTracker imuMotionTracker = {};
     bool idleSleepLogged = false;
+    bool allowLowPower = false;
 };
 
 class PowerManager
@@ -243,7 +245,7 @@ private:
                 markActivity(nowMs);
             }
 
-            if (handleIdleSleep(nowMs)) {
+            if (handleIdleSleep(nowMs, readings)) {
                 continue;
             }
 
@@ -498,10 +500,21 @@ private:
 
         PowerEvent event = {};
         while (osalQueueReceive(&eventQueue_, &event, 0) == OSAL_STATUS_OK) {
-            if (event.type == PowerEventType::KEY_EVENT
-                && event.key_event.action == PowerKeyAction::POWEROFF_CONFIRM_YES) {
-                LOGI("Power off confirmed by UI");
-                M5.Power.powerOff();
+            if (event.type == PowerEventType::KEY_EVENT) {
+                if (event.key_event.action == PowerKeyAction::POWEROFF_CONFIRM_YES) {
+                    LOGI("Power off confirmed by UI");
+                    M5.Power.powerOff();
+                }
+                continue;
+            }
+
+            if (event.type == PowerEventType::IDLE_POLICY_UPDATE) {
+                const bool wasAllowed = state_.allowLowPower;
+                state_.allowLowPower = event.idle_policy_event.allow_low_power;
+
+                if (wasAllowed && !state_.allowLowPower) {
+                    markActivity(M5.millis());
+                }
             }
         }
     }
@@ -668,14 +681,32 @@ private:
         requestUiDisplayPower(UiDisplayPowerAction::WAKE);
     }
 
-    bool handleIdleSleep(uint32_t nowMs)
+    static bool isChargingNow(const PowerReadings& readings)
+    {
+        return readings.chargeState == 1;
+    }
+
+    bool handleIdleSleep(uint32_t nowMs, const PowerReadings& readings)
     {
         if ((nowMs - state_.lastActivityMs) < kPowerIdleSleepTimeoutMs || nowMs < state_.nextSleepAttemptMs) {
             return false;
         }
 
+        if (isChargingNow(readings)) {
+            state_.idleSleepLogged = false;
+            state_.nextSleepAttemptMs = nowMs + kPowerIdleBlockedRetryMs;
+            return false;
+        }
+
+        if (!state_.allowLowPower) {
+            state_.idleSleepLogged = false;
+            state_.nextSleepAttemptMs = nowMs + kPowerIdleBlockedRetryMs;
+            return false;
+        }
+
         if (!state_.idleSleepLogged) {
-            LOGI("Idle for %u ms; entering light sleep", static_cast<unsigned>(kPowerIdleSleepTimeoutMs));
+            LOGI("Idle for %u ms; policy allows low power, entering low power",
+                 static_cast<unsigned>(kPowerIdleSleepTimeoutMs));
             state_.idleSleepLogged = true;
         }
 

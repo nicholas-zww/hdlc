@@ -5,6 +5,7 @@
 #include <M5Unified.h>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #define LOG_TAG "UiTask"
 #include "logger.h"
@@ -19,6 +20,40 @@ constexpr uint8_t kDisplayRotation = 3;  // 180 degree rotation
 constexpr int kOriginX = 8;
 constexpr int kOriginY = 8;
 constexpr int kLineHeight = 18;
+constexpr uint32_t kI2cFreq = 100000;
+constexpr uint8_t kLtr553Addr = 0x23;
+constexpr uint8_t kLtrRegAlsContr = 0x80;
+constexpr uint8_t kLtrRegPsContr = 0x81;
+constexpr uint8_t kLtrRegPsLed = 0x82;
+constexpr uint8_t kLtrRegPsNPulses = 0x83;
+constexpr uint8_t kLtrRegPsMeasRate = 0x84;
+constexpr uint8_t kLtrRegAlsMeasRate = 0x85;
+constexpr uint8_t kLtrRegAlsDataCh1 = 0x88;
+constexpr uint8_t kLtrRegPsData = 0x8D;
+constexpr uint8_t kLtrPsModeMask = 0x02;
+constexpr uint8_t kLtrPsModeShift = 1;
+constexpr uint8_t kLtrAlsModeMask = 0x01;
+constexpr uint8_t kLtrAlsModeShift = 0;
+constexpr uint8_t kLtrAlsGainMask = 0x1C;
+constexpr uint8_t kLtrAlsGainShift = 2;
+constexpr uint8_t kLtrAlsIntegrationMask = 0x38;
+constexpr uint8_t kLtrAlsMeasureMask = 0x07;
+constexpr uint8_t kLtrPsDataHighMask = 0x07;
+constexpr uint8_t kLtrDefaultPsLedReg = 0x7C;     // 60kHz, 100% duty, 100mA peak
+constexpr uint8_t kLtrDefaultPsPulseCount = 0x01; // 1 pulse
+constexpr uint8_t kLtrDefaultPsMeasRate = 0x02;   // 100ms
+constexpr uint8_t kLtrDefaultAlsMeasRate = 0x03;  // 100ms integration, 500ms rate
+constexpr uint16_t kProximityClosedThreshold = 180;
+constexpr uint16_t kProximityOpenThreshold = 120;
+constexpr uint32_t kProximitySamplePeriodMs = 100;
+
+struct ProximityStatus
+{
+    bool available = false;
+    bool closed = false;
+    int16_t proximityRaw = -1;
+    int16_t ambientRaw = -1;
+};
 
 struct Rect
 {
@@ -46,6 +81,12 @@ public:
         }
 
         initializeDisplay();
+        proximitySensorReady_ = initializeProximitySensor();
+        if (proximitySensorReady_) {
+            LOGI("LTR553 proximity sensor initialized in UI task");
+        } else {
+            LOGW("LTR553 proximity sensor unavailable in UI task");
+        }
 
         const osalThreadAttr_t uiTaskAttr = {
             .stack_size_bytes = 4096,
@@ -83,6 +124,9 @@ private:
         UiPowerInfoEvent latestPowerInfo = {};
         bool hasPowerInfo = false;
 
+        ProximityStatus latestProximity = {};
+        bool hasProximity = false;
+
         UiWakeupEventData latestWakeup = {};
         bool hasWakeup = false;
 
@@ -91,6 +135,8 @@ private:
 
         UiPowerInfoEvent renderedPowerInfo = {};
         bool renderedPowerInfoValid = false;
+        ProximityStatus renderedProximity = {};
+        bool renderedProximityValid = false;
         UiWakeupEventData renderedWakeup = {};
         bool renderedWakeupValid = false;
         UiWifiStatusEventData renderedWifiStatus = {};
@@ -100,6 +146,10 @@ private:
         Screen screen = Screen::PowerInfo;
         bool touchWasDown = false;
         bool displaySleeping = false;
+        bool proximityValid = false;
+        uint32_t nextProximitySampleMs = 0;
+        ProximityStatus lastPublishedProximity = {};
+        bool lastPublishedProximityValid = false;
     };
 
     static void taskEntry(void* context)
@@ -113,6 +163,9 @@ private:
     void taskLoop()
     {
         state_ = {};
+        state_.latestProximity.available = proximitySensorReady_;
+        state_.hasProximity = proximitySensorReady_;
+        state_.nextProximitySampleMs = M5.millis();
         UiEvent event = {};
 
         while (true) {
@@ -121,6 +174,7 @@ private:
             }
 
             handlePowerOffConfirmTouch();
+            pollProximity();
         }
     }
 
@@ -206,6 +260,222 @@ private:
         }
     }
 
+    static bool proximityEqual(const ProximityStatus& a, const ProximityStatus& b)
+    {
+        return a.available == b.available
+               && a.closed == b.closed
+               && a.proximityRaw == b.proximityRaw
+               && a.ambientRaw == b.ambientRaw;
+    }
+
+    bool publishIdlePolicyToPowerTask(bool force)
+    {
+        const bool allowLowPowerNow =
+            state_.latestProximity.available && state_.latestProximity.closed;
+        const bool allowLowPowerLast =
+            state_.lastPublishedProximity.available && state_.lastPublishedProximity.closed;
+
+        if (!force && state_.lastPublishedProximityValid && (allowLowPowerNow == allowLowPowerLast)) {
+            return true;
+        }
+
+        PowerEvent event = {};
+        event.type = PowerEventType::IDLE_POLICY_UPDATE;
+        event.idle_policy_event.allow_low_power = allowLowPowerNow;
+
+        if (!postPowerEvent(event)) {
+            LOGW("Failed to post idle policy update to power task");
+            return false;
+        }
+
+        state_.lastPublishedProximity = state_.latestProximity;
+        state_.lastPublishedProximityValid = true;
+        return true;
+    }
+
+    [[nodiscard]] bool ltrReadRegister(uint8_t reg, uint8_t& value) const
+    {
+        return M5.In_I2C.readRegister(kLtr553Addr, reg, &value, 1, kI2cFreq);
+    }
+
+    [[nodiscard]] bool ltrReadRegisters(uint8_t reg, uint8_t* values, size_t count) const
+    {
+        return M5.In_I2C.readRegister(kLtr553Addr, reg, values, count, kI2cFreq);
+    }
+
+    [[nodiscard]] bool ltrWriteRegister(uint8_t reg, uint8_t value) const
+    {
+        return M5.In_I2C.writeRegister(kLtr553Addr, reg, &value, 1, kI2cFreq);
+    }
+
+    [[nodiscard]] bool ltrUpdateRegisterBits(uint8_t reg, uint8_t mask, uint8_t value) const
+    {
+        uint8_t current = 0;
+        if (!ltrReadRegister(reg, current)) {
+            return false;
+        }
+
+        current = static_cast<uint8_t>((current & static_cast<uint8_t>(~mask)) | (value & mask));
+        return ltrWriteRegister(reg, current);
+    }
+
+    [[nodiscard]] bool ltrSetPsMode(bool active) const
+    {
+        const uint8_t value = static_cast<uint8_t>((active ? 1U : 0U) << kLtrPsModeShift);
+        return ltrUpdateRegisterBits(kLtrRegPsContr, kLtrPsModeMask, value);
+    }
+
+    [[nodiscard]] bool ltrSetAlsMode(bool active) const
+    {
+        const uint8_t value = static_cast<uint8_t>((active ? 1U : 0U) << kLtrAlsModeShift);
+        return ltrUpdateRegisterBits(kLtrRegAlsContr, kLtrAlsModeMask, value);
+    }
+
+    [[nodiscard]] bool initializeProximitySensor() const
+    {
+        uint8_t probe = 0;
+        if (!ltrReadRegister(kLtrRegAlsMeasRate, probe)) {
+            return false;
+        }
+
+        if (!ltrSetPsMode(false)) {
+            return false;
+        }
+        if (!ltrSetAlsMode(false)) {
+            return false;
+        }
+
+        if (!ltrWriteRegister(kLtrRegPsLed, kLtrDefaultPsLedReg)) {
+            return false;
+        }
+        if (!ltrWriteRegister(kLtrRegPsNPulses, kLtrDefaultPsPulseCount)) {
+            return false;
+        }
+        if (!ltrWriteRegister(kLtrRegPsMeasRate, kLtrDefaultPsMeasRate)) {
+            return false;
+        }
+
+        if (!ltrUpdateRegisterBits(kLtrRegAlsContr, kLtrAlsGainMask, static_cast<uint8_t>(0U << kLtrAlsGainShift))) {
+            return false;
+        }
+
+        const uint8_t alsRateValue =
+            static_cast<uint8_t>((0U & kLtrAlsIntegrationMask) | (kLtrDefaultAlsMeasRate & kLtrAlsMeasureMask));
+        if (!ltrWriteRegister(kLtrRegAlsMeasRate, alsRateValue)) {
+            return false;
+        }
+
+        if (!ltrSetPsMode(true)) {
+            return false;
+        }
+        if (!ltrSetAlsMode(true)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    [[nodiscard]] bool readProximity(uint16_t& proximityRaw, uint16_t& ambientRaw) const
+    {
+        uint8_t psData[2] = {};
+        if (!ltrReadRegisters(kLtrRegPsData, psData, sizeof(psData))) {
+            return false;
+        }
+        proximityRaw = static_cast<uint16_t>(((psData[1] & kLtrPsDataHighMask) << 8) | psData[0]);
+
+        uint8_t alsData[4] = {};
+        if (!ltrReadRegisters(kLtrRegAlsDataCh1, alsData, sizeof(alsData))) {
+            return false;
+        }
+        const uint16_t ch1 = static_cast<uint16_t>((alsData[1] << 8) | alsData[0]);
+        const uint16_t ch0 = static_cast<uint16_t>((alsData[3] << 8) | alsData[2]);
+        ambientRaw = static_cast<uint16_t>((static_cast<uint32_t>(ch1) + static_cast<uint32_t>(ch0)) / 2U);
+        return true;
+    }
+
+    void updateProximityState(uint32_t nowMs)
+    {
+        if (!state_.latestProximity.available || nowMs < state_.nextProximitySampleMs) {
+            return;
+        }
+
+        state_.nextProximitySampleMs = nowMs + kProximitySamplePeriodMs;
+
+        uint16_t proximityRaw = 0;
+        uint16_t ambientRaw = 0;
+        if (!readProximity(proximityRaw, ambientRaw)) {
+            LOGW("Failed reading LTR553 in UI; disabling proximity sensor");
+            state_.latestProximity = {};
+            state_.latestProximity.available = false;
+            state_.latestProximity.proximityRaw = -1;
+            state_.latestProximity.ambientRaw = -1;
+            state_.proximityValid = false;
+            state_.hasProximity = true;
+            publishIdlePolicyToPowerTask(true);
+            if (state_.screen == Screen::PowerInfo) {
+                renderPowerInfoScreen();
+            }
+            return;
+        }
+
+        const bool prevValid = state_.proximityValid;
+        const bool prevClosed = state_.latestProximity.closed;
+
+        state_.latestProximity.proximityRaw = static_cast<int16_t>(proximityRaw);
+        state_.latestProximity.ambientRaw =
+            (ambientRaw > static_cast<uint16_t>(std::numeric_limits<int16_t>::max()))
+                ? std::numeric_limits<int16_t>::max()
+                : static_cast<int16_t>(ambientRaw);
+        state_.latestProximity.available = true;
+
+        if (!state_.proximityValid) {
+            state_.latestProximity.closed = (proximityRaw >= kProximityClosedThreshold);
+            state_.proximityValid = true;
+        } else if (state_.latestProximity.closed) {
+            if (proximityRaw <= kProximityOpenThreshold) {
+                state_.latestProximity.closed = false;
+            }
+        } else if (proximityRaw >= kProximityClosedThreshold) {
+            state_.latestProximity.closed = true;
+        }
+
+        state_.hasProximity = true;
+
+        const bool changed = !state_.lastPublishedProximityValid
+                             || !prevValid
+                             || (prevClosed != state_.latestProximity.closed);
+
+        if (changed) {
+            publishIdlePolicyToPowerTask(false);
+            if (state_.screen == Screen::PowerInfo) {
+                renderPowerInfoScreen();
+            }
+        }
+    }
+
+    void applyProximityDisplayPolicy()
+    {
+        if (!state_.hasProximity || !state_.latestProximity.available) {
+            return;
+        }
+
+        if (state_.latestProximity.closed) {
+            sleepDisplayIfNeeded();
+        } else {
+            wakeDisplayIfNeeded();
+        }
+    }
+
+    void pollProximity()
+    {
+        if (!state_.latestProximity.available) {
+            return;
+        }
+
+        updateProximityState(M5.millis());
+        applyProximityDisplayPolicy();
+    }
+
     static void formatPowerLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
     {
         std::snprintf(out, outSize, "Power: %s", info.usb_powered ? "USB" : "BATTERY");
@@ -233,6 +503,21 @@ private:
     static void formatVbusLine(char* out, size_t outSize, const UiPowerInfoEvent& info)
     {
         std::snprintf(out, outSize, "VBUS: %dmV", static_cast<int>(info.vbus_voltage_mv));
+    }
+
+    static void formatProximityLine(char* out, size_t outSize, const ProximityStatus* proximity)
+    {
+        if (proximity == nullptr || !proximity->available) {
+            std::snprintf(out, outSize, "Prox: n/a");
+            return;
+        }
+
+        std::snprintf(out,
+                      outSize,
+                      "Prox: %s ps=%d als=%d",
+                      proximity->closed ? "CLOSED" : "OPEN",
+                      static_cast<int>(proximity->proximityRaw),
+                      static_cast<int>(proximity->ambientRaw));
     }
 
     static void formatWakeLine(char* out, size_t outSize, const UiWakeupEventData* wakeup)
@@ -320,7 +605,23 @@ private:
                    != 0);
     }
 
+    static bool proximityChanged(const ProximityStatus* newProximity,
+                                 bool renderedProximityValid,
+                                 const ProximityStatus& renderedProximity)
+    {
+        if (newProximity == nullptr) {
+            return renderedProximityValid;
+        }
+
+        if (!renderedProximityValid) {
+            return true;
+        }
+
+        return !proximityEqual(*newProximity, renderedProximity);
+    }
+
     void renderPowerInfo(const UiPowerInfoEvent& info,
+                         const ProximityStatus* proximity,
                          const UiWakeupEventData* wakeup,
                          const UiWifiStatusEventData* wifiStatus,
                          bool forceFullRedraw)
@@ -333,12 +634,15 @@ private:
                                   || (info.battery_voltage_mv != state_.renderedPowerInfo.battery_voltage_mv)
                                   || (info.vbus_voltage_mv != state_.renderedPowerInfo.vbus_voltage_mv);
 
+        const bool proximityStatusChanged = proximityChanged(proximity,
+                                                             state_.renderedProximityValid,
+                                                             state_.renderedProximity);
         const bool wakeChanged = wakeupChanged(wakeup, state_.renderedWakeupValid, state_.renderedWakeup);
         const bool wifiStatusChanged = wifiChanged(wifiStatus,
                                                    state_.renderedWifiStatusValid,
                                                    state_.renderedWifiStatus);
 
-        if (!forceFullRedraw && !powerChanged && !wakeChanged && !wifiStatusChanged) {
+        if (!forceFullRedraw && !powerChanged && !proximityStatusChanged && !wakeChanged && !wifiStatusChanged) {
             return;
         }
 
@@ -366,19 +670,25 @@ private:
 
             formatVbusLine(line, sizeof(line), info);
             drawPowerInfoLine(4, line);
+
+        }
+
+        if (forceFullRedraw || proximityStatusChanged) {
+            formatProximityLine(line, sizeof(line), proximity);
+            drawPowerInfoLine(5, line);
         }
 
         if (forceFullRedraw || wakeChanged) {
             formatWakeLine(line, sizeof(line), wakeup);
-            drawPowerInfoLine(5, line);
+            drawPowerInfoLine(6, line);
 
             formatSleepErrorLine(line, sizeof(line), wakeup);
-            drawPowerInfoLine(6, line);
+            drawPowerInfoLine(7, line);
         }
 
         if (forceFullRedraw || wifiStatusChanged) {
             formatWifiLine(line, sizeof(line), wifiStatus);
-            drawPowerInfoLine(7, line);
+            drawPowerInfoLine(8, line);
         }
 
         M5.Display.endWrite();
@@ -401,12 +711,22 @@ private:
             state_.renderedWifiStatus = {};
             state_.renderedWifiStatusValid = false;
         }
+
+        if (proximity != nullptr) {
+            state_.renderedProximity = *proximity;
+            state_.renderedProximityValid = true;
+        } else {
+            state_.renderedProximity = {};
+            state_.renderedProximityValid = false;
+        }
     }
 
     void resetPowerInfoRenderCache()
     {
         state_.renderedPowerInfo = {};
         state_.renderedPowerInfoValid = false;
+        state_.renderedProximity = {};
+        state_.renderedProximityValid = false;
         state_.renderedWakeup = {};
         state_.renderedWakeupValid = false;
         state_.renderedWifiStatus = {};
@@ -446,10 +766,11 @@ private:
             return;
         }
 
+        const ProximityStatus* proximity = state_.hasProximity ? &state_.latestProximity : nullptr;
         const UiWakeupEventData* wakeup = state_.hasWakeup ? &state_.latestWakeup : nullptr;
         const UiWifiStatusEventData* wifiStatus = state_.hasWifiStatus ? &state_.latestWifiStatus : nullptr;
         const bool forceFullRedraw = !state_.renderedPowerInfoScreen;
-        renderPowerInfo(state_.latestPowerInfo, wakeup, wifiStatus, forceFullRedraw);
+        renderPowerInfo(state_.latestPowerInfo, proximity, wakeup, wifiStatus, forceFullRedraw);
         state_.renderedPowerInfoScreen = true;
     }
 
@@ -641,6 +962,7 @@ private:
     osalQueue_t eventQueue_ = {};
     osalThread_t taskThread_ = {};
     bool queueReady_ = false;
+    bool proximitySensorReady_ = false;
     State state_ = {};
 };
 
